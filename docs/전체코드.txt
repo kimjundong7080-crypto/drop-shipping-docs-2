@@ -1,0 +1,2252 @@
+전체 코드베이스입니다. 모든 기능(상품 동기화·미리보기·발주·리스팅·댓글 답글)과 보안 계층(HMAC 검증·감사 로그·PII 마스킹·API 키 인증)을 포함합니다. 실제 운영 전 각 API 엔드포인트와 응답 필드는 공식 문서로 재확인하세요.
+
+---
+
+## 프로젝트 구조
+
+```
+dropship-sync/
+├── .env.example
+├── .gitignore
+├── requirements.txt
+├── config.py
+├── db.py
+├── models.py
+├── main.py
+├── clients/
+│   ├── __init__.py
+│   ├── cj_client.py
+│   ├── woo_client.py
+│   └── shopify_client.py
+├── services/
+│   ├── __init__.py
+│   ├── normalizer.py
+│   ├── pricing.py
+│   ├── product_sync.py
+│   ├── inventory_sync.py
+│   ├── order_service.py
+│   ├── listing_service.py
+│   └── comment_service.py
+├── utils/
+│   ├── __init__.py
+│   ├── throttle.py
+│   ├── logging_setup.py
+│   ├── audit.py
+│   └── security.py
+├── webhook/
+│   ├── __init__.py
+│   └── receiver.py
+└── preview/
+    ├── __init__.py
+    └── app.py
+```
+
+---
+
+## requirements.txt
+
+```txt
+requests>=2.31.0
+python-dotenv>=1.0.1
+woocommerce>=3.0.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+tenacity>=8.2.3
+jinja2>=3.1.3
+python-multipart>=0.0.9
+```
+
+---
+
+## .env.example
+
+```ini
+# --- CJ Dropshipping ---
+CJ_BASE=https://developers.cjdropshipping.com/api2.0/v1
+CJ_EMAIL=your@email.com
+CJ_API_KEY=your_api_key
+CJ_OPEN_ID=your_open_id_here
+CJ_QPS=1
+CJ_SANDBOX=0
+
+# --- WooCommerce ---
+WC_URL=https://your-store.com
+WC_CK=ck_xxxxxxxxxxxxxxxxxxxx
+WC_CS=cs_xxxxxxxxxxxxxxxxxxxx
+
+# --- WordPress (리뷰 답글용 Application Password) ---
+WP_USER=admin
+WP_APP_PASSWORD=xxxx xxxx xxxx xxxx xxxx xxxx
+
+# --- Shopify ---
+SHOPIFY_SHOP=your-store.myshopify.com
+SHOPIFY_TOKEN=shpat_xxxxxxxxxxxxxxxxxxxx
+SHOPIFY_API_VERSION=2025-10
+SHOPIFY_CLIENT_SECRET=your_app_client_secret
+SHOPIFY_LOCATION_ID=gid://shopify/Location/123456
+
+# --- 로컬 서버 ---
+LOCAL_API_KEY=generate-a-long-random-string
+LOCAL_BIND_HOST=127.0.0.1
+LOCAL_BIND_PORT=8000
+
+# --- 가격 정책 ---
+PRICING_MARGIN=0.35
+PRICING_ROUNDING=0.99
+PRICING_CURRENCY=USD
+```
+
+---
+
+## .gitignore
+
+```
+.env
+*.db
+*.db-wal
+*.db-shm
+.cj_token.json
+logs/
+__pycache__/
+*.pyc
+.venv/
+venv/
+```
+
+---
+
+## config.py
+
+```python
+import os
+from dataclasses import dataclass
+from decimal import Decimal
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def _req(key: str) -> str:
+    val = os.environ.get(key)
+    if not val:
+        raise RuntimeError(f"Missing required env: {key}")
+    return val
+
+
+@dataclass(frozen=True)
+class Config:
+    # CJ
+    cj_base: str = os.environ.get("CJ_BASE", "https://developers.cjdropshipping.com/api2.0/v1")
+    cj_email: str = _req("CJ_EMAIL")
+    cj_api_key: str = _req("CJ_API_KEY")
+    cj_open_id: str = _req("CJ_OPEN_ID")
+    cj_qps: float = float(os.environ.get("CJ_QPS", "1"))
+    cj_sandbox: int = int(os.environ.get("CJ_SANDBOX", "0"))
+
+    # WooCommerce
+    wc_url: str = _req("WC_URL")
+    wc_ck: str = _req("WC_CK")
+    wc_cs: str = _req("WC_CS")
+    wp_user: str = _req("WP_USER")
+    wp_app_password: str = _req("WP_APP_PASSWORD")
+
+    # Shopify
+    shopify_shop: str = _req("SHOPIFY_SHOP")
+    shopify_token: str = _req("SHOPIFY_TOKEN")
+    shopify_api_version: str = os.environ.get("SHOPIFY_API_VERSION", "2025-10")
+    shopify_client_secret: str = _req("SHOPIFY_CLIENT_SECRET")
+    shopify_location_id: str = _req("SHOPIFY_LOCATION_ID")
+
+    # Local server
+    local_api_key: str = _req("LOCAL_API_KEY")
+    local_bind_host: str = os.environ.get("LOCAL_BIND_HOST", "127.0.0.1")
+    local_bind_port: int = int(os.environ.get("LOCAL_BIND_PORT", "8000"))
+
+    # Pricing
+    pricing_margin: Decimal = Decimal(os.environ.get("PRICING_MARGIN", "0.35"))
+    pricing_rounding: Decimal = Decimal(os.environ.get("PRICING_ROUNDING", "0.99"))
+    pricing_currency: str = os.environ.get("PRICING_CURRENCY", "USD")
+
+
+cfg = Config()
+```
+
+---
+
+## db.py
+
+```python
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+
+DB_PATH = Path("dropship.db")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS canonical_products (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_sku TEXT UNIQUE NOT NULL,
+    title         TEXT NOT NULL,
+    created_at    TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS supplier_products (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    supplier      TEXT NOT NULL,
+    supplier_pid  TEXT NOT NULL,
+    supplier_sku  TEXT NOT NULL,
+    supplier_vid  TEXT,
+    raw_json      TEXT,
+    last_synced   TEXT,
+    UNIQUE(supplier, supplier_sku)
+);
+
+CREATE TABLE IF NOT EXISTS channel_variants (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_sku     TEXT NOT NULL,
+    channel           TEXT NOT NULL,
+    channel_product_id TEXT NOT NULL,
+    channel_variant_id TEXT NOT NULL,
+    channel_sku       TEXT,
+    inventory_item_id TEXT,
+    last_pushed_qty   INTEGER DEFAULT 0,
+    UNIQUE(channel, channel_variant_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cv_sku ON channel_variants(canonical_sku);
+
+CREATE TABLE IF NOT EXISTS mapping (
+    canonical_sku TEXT NOT NULL,
+    supplier      TEXT NOT NULL,
+    supplier_sku  TEXT NOT NULL,
+    priority      INTEGER DEFAULT 1,
+    verified      INTEGER DEFAULT 0,
+    PRIMARY KEY (canonical_sku, supplier, supplier_sku)
+);
+
+CREATE TABLE IF NOT EXISTS orders (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel           TEXT NOT NULL,
+    channel_order_id  TEXT NOT NULL,
+    channel_order_num TEXT,
+    status            TEXT,
+    financial_status  TEXT,
+    total             TEXT,
+    currency          TEXT,
+    customer_email    TEXT,
+    shipping_address  TEXT,
+    preferred_logistic TEXT,
+    raw_json          TEXT,
+    fetched_at        TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(channel, channel_order_id)
+);
+
+CREATE TABLE IF NOT EXISTS order_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id        INTEGER NOT NULL,
+    channel_line_id TEXT NOT NULL,
+    supplier_sku    TEXT,
+    quantity        INTEGER NOT NULL,
+    unit_price      TEXT,
+    mapped          INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_oi_order ON order_items(order_id);
+
+CREATE TABLE IF NOT EXISTS cj_orders (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    local_order_id   INTEGER NOT NULL UNIQUE,
+    cj_order_number  TEXT UNIQUE NOT NULL,
+    cj_order_id      TEXT,
+    status           TEXT DEFAULT 'PENDING',
+    tracking_number  TEXT,
+    logistic_name    TEXT,
+    is_sandbox       INTEGER DEFAULT 0,
+    created_at       TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at       TEXT
+);
+
+CREATE TABLE IF NOT EXISTS comments (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel            TEXT NOT NULL,
+    channel_comment_id TEXT NOT NULL,
+    product_ref        TEXT,
+    author             TEXT,
+    body               TEXT,
+    rating             INTEGER,
+    status             TEXT,
+    parent_id          TEXT,
+    created_at         TEXT,
+    raw_json           TEXT,
+    UNIQUE(channel, channel_comment_id)
+);
+
+CREATE TABLE IF NOT EXISTS comment_replies (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    comment_id        INTEGER NOT NULL UNIQUE,
+    channel           TEXT NOT NULL,
+    channel_reply_id  TEXT,
+    body              TEXT,
+    status            TEXT DEFAULT 'draft',
+    created_at        TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS webhook_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider     TEXT NOT NULL,
+    delivery_id  TEXT NOT NULL,
+    topic        TEXT,
+    received_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+    processed    INTEGER DEFAULT 0,
+    UNIQUE(provider, delivery_id)
+);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            TEXT DEFAULT CURRENT_TIMESTAMP,
+    actor         TEXT,
+    action        TEXT NOT NULL,
+    target        TEXT,
+    before_json   TEXT,
+    after_json    TEXT,
+    request_id    TEXT,
+    prev_hash     TEXT,
+    entry_hash    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cost_ledger (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id      INTEGER NOT NULL,
+    entry_type    TEXT NOT NULL,
+    amount        TEXT NOT NULL,
+    currency      TEXT,
+    note          TEXT,
+    ts            TEXT DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+
+def init_db() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executescript(SCHEMA)
+        conn.commit()
+
+
+@contextmanager
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+```
+
+---
+
+## models.py
+
+```python
+from dataclasses import dataclass, field
+from decimal import Decimal
+
+
+@dataclass
+class Variant:
+    supplier_sku: str
+    supplier_vid: str
+    price: Decimal
+    stock: int
+    options: dict[str, str] = field(default_factory=dict)
+    image: str | None = None
+
+
+@dataclass
+class NormalizedProduct:
+    supplier: str
+    supplier_pid: str
+    title: str
+    description_html: str
+    images: list[str]
+    variants: list[Variant]
+    category: str | None = None
+    tags: list[str] = field(default_factory=list)
+
+    @property
+    def canonical_sku(self) -> str:
+        return f"{self.supplier.upper()}-{self.supplier_pid}"
+```
+
+---
+
+## utils/throttle.py
+
+```python
+import time
+import threading
+
+
+class TokenBucket:
+    def __init__(self, rate: float, capacity: float | None = None):
+        self.rate = rate
+        self.capacity = capacity or max(1.0, rate)
+        self.tokens = self.capacity
+        self.last = time.monotonic()
+        self.lock = threading.Lock()
+
+    def acquire(self, amount: float = 1.0) -> None:
+        with self.lock:
+            while True:
+                now = time.monotonic()
+                self.tokens = min(
+                    self.capacity,
+                    self.tokens + (now - self.last) * self.rate,
+                )
+                self.last = now
+                if self.tokens >= amount:
+                    self.tokens -= amount
+                    return
+                time.sleep((amount - self.tokens) / self.rate)
+```
+
+---
+
+## utils/logging_setup.py
+
+```python
+import logging
+import re
+
+_MASK_KEYS = re.compile(
+    r"(access[_-]?token|authorization|api[_-]?key|client[_-]?secret|"
+    r"open[_-]?id|sign|password|cookie|shpat_[A-Za-z0-9]+)",
+    re.IGNORECASE,
+)
+_EMAIL = re.compile(r"([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+)")
+_PHONE = re.compile(r"\b(\+?\d{1,3})?[\s.-]?\(?\d{2,4}\)?[\s.-]?\d{3,4}[\s.-]?\d{4}\b")
+
+
+class PIIRedactionFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        msg = _MASK_KEYS.sub(r"\1=***", msg)
+        msg = _EMAIL.sub(r"\1***@\2", msg)
+        msg = _PHONE.sub("***-****-****", msg)
+        record.msg = msg
+        record.args = ()
+        return True
+
+
+def setup_logging(level=logging.INFO):
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s :: %(message)s"
+    ))
+    handler.addFilter(PIIRedactionFilter())
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(level)
+```
+
+---
+
+## utils/audit.py
+
+```python
+import hashlib
+import json
+from datetime import datetime, timezone
+from db import get_conn
+
+
+def _genesis_hash() -> str:
+    return "0" * 64
+
+
+def _last_hash() -> str:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    return row["entry_hash"] if row else _genesis_hash()
+
+
+def append_audit(actor: str, action: str, target: str,
+                 before: dict | None = None, after: dict | None = None,
+                 request_id: str | None = None) -> str:
+    prev = _last_hash()
+    payload = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "actor": actor,
+        "action": action,
+        "target": target,
+        "before": before,
+        "after": after,
+        "request_id": request_id,
+        "prev_hash": prev,
+    }
+    entry_hash = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO audit_log
+               (ts, actor, action, target, before_json, after_json,
+                request_id, prev_hash, entry_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                payload["ts"], actor, action, target,
+                json.dumps(before, default=str) if before else None,
+                json.dumps(after, default=str) if after else None,
+                request_id, prev, entry_hash,
+            ),
+        )
+    return entry_hash
+
+
+def verify_audit_chain() -> bool:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM audit_log ORDER BY id").fetchall()
+    prev = _genesis_hash()
+    for r in rows:
+        if r["prev_hash"] != prev:
+            return False
+        payload = {
+            "ts": r["ts"], "actor": r["actor"], "action": r["action"],
+            "target": r["target"],
+            "before": json.loads(r["before_json"]) if r["before_json"] else None,
+            "after": json.loads(r["after_json"]) if r["after_json"] else None,
+            "request_id": r["request_id"], "prev_hash": prev,
+        }
+        expected = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=str).encode()
+        ).hexdigest()
+        if expected != r["entry_hash"]:
+            return False
+        prev = r["entry_hash"]
+    return True
+```
+
+---
+
+## utils/security.py
+
+```python
+import hmac
+import hashlib
+import base64
+from fastapi import Header, HTTPException
+from config import cfg
+
+
+def verify_cj(raw_body: bytes, sign_header: str) -> bool:
+    if not sign_header:
+        return False
+    expected = base64.b64encode(
+        hmac.new(cfg.cj_open_id.encode(), raw_body, hashlib.sha256).digest()
+    ).decode()
+    return hmac.compare_digest(sign_header, expected)
+
+
+def verify_shopify(raw_body: bytes, hmac_header: str) -> bool:
+    if not hmac_header:
+        return False
+    computed = hmac.new(
+        cfg.shopify_client_secret.encode(), raw_body, hashlib.sha256
+    ).digest()
+    try:
+        provided = base64.b64decode(hmac_header)
+    except Exception:
+        return False
+    return hmac.compare_digest(computed, provided)
+
+
+def verify_woo(raw_body: bytes, sign_header: str, secret: str) -> bool:
+    if not sign_header:
+        return False
+    expected = base64.b64encode(
+        hmac.new(secret.encode(), raw_body, hashlib.sha256).digest()
+    ).decode()
+    return hmac.compare_digest(sign_header, expected)
+
+
+async def require_api_key(x_api_key: str = Header(default="")) -> None:
+    if not x_api_key or not hmac.compare_digest(x_api_key, cfg.local_api_key):
+        raise HTTPException(status_code=401, detail="invalid api key")
+```
+
+---
+
+## clients/cj_client.py
+
+```python
+import json
+import time
+from pathlib import Path
+
+import requests
+from tenacity import (
+    retry, wait_exponential, stop_after_attempt,
+    retry_if_exception_type,
+)
+
+from config import cfg
+from utils.throttle import TokenBucket
+
+TOKEN_CACHE = Path(".cj_token.json")
+
+
+class TransientAPIError(Exception):
+    pass
+
+
+class CJClient:
+    def __init__(self):
+        self.session = requests.Session()
+        self.bucket = TokenBucket(rate=cfg.cj_qps)
+        self._token: str | None = self._load_token()
+
+    def _load_token(self) -> str | None:
+        if TOKEN_CACHE.exists():
+            try:
+                data = json.loads(TOKEN_CACHE.read_text())
+                if data.get("expiry", 0) > time.time() + 60:
+                    return data["token"]
+            except Exception:
+                pass
+        return None
+
+    def _authenticate(self) -> str:
+        resp = self.session.post(
+            f"{cfg.cj_base}/authentication/getAccessToken",
+            json={"email": cfg.cj_email, "password": cfg.cj_api_key},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if not body.get("result"):
+            raise RuntimeError(f"CJ auth failed: {body}")
+        token = body["data"]["accessToken"]
+        expiry = time.time() + body["data"].get("expiresIn", 3600) - 120
+        TOKEN_CACHE.write_text(json.dumps({"token": token, "expiry": expiry}))
+        return token
+
+    @property
+    def token(self) -> str:
+        if self._token is None:
+            self._token = self._authenticate()
+        return self._token
+
+    def _raw_get(self, path: str, params: dict | None = None) -> dict:
+        self.bucket.acquire()
+        resp = self.session.get(
+            f"{cfg.cj_base}{path}",
+            headers={"CJ-Access-Token": self.token},
+            params=params or {},
+            timeout=30,
+        )
+        if resp.status_code == 401:
+            TOKEN_CACHE.unlink(missing_ok=True)
+            self._token = self._authenticate()
+            return self._raw_get(path, params)
+        if resp.status_code in (429, 500, 502, 503):
+            raise TransientAPIError(f"CJ transient {resp.status_code}")
+        resp.raise_for_status()
+        body = resp.json()
+        if not body.get("result"):
+            raise RuntimeError(f"CJ error {path}: {body}")
+        return body["data"]
+
+    @retry(
+        retry=retry_if_exception_type(TransientAPIError),
+        wait=wait_exponential(multiplier=1, min=2, max=60),
+        stop=stop_after_attempt(5),
+        reraise=True,
+    )
+    def get(self, path: str, params: dict | None = None) -> dict:
+        return self._raw_get(path, params)
+
+    # ---- 상품 관련 ----
+    def list_products(self, keyword: str, page: int = 1, size: int = 50) -> list[dict]:
+        data = self.get(
+            "/product/list",
+            {"productNameEn": keyword, "pageNum": page, "pageSize": size},
+        )
+        return data.get("list", [])
+
+    def variant_query(self, pid: str) -> dict:
+        return self.get("/product/variant/query", {"pid": pid})
+
+    # ---- 운임 / 물류 ----
+    def calculate_freight(self, payload: dict) -> dict:
+        self.bucket.acquire()
+        resp = self.session.post(
+            f"{cfg.cj_base}/logistic/freightCalculate",
+            headers={"CJ-Access-Token": self.token},
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json().get("data", {})
+
+    # ---- 주문 ----
+    def create_order(self, payload: dict) -> dict:
+        self.bucket.acquire()
+        resp = self.session.post(
+            f"{cfg.cj_base}/shopping/order/createOrder",
+            headers={"CJ-Access-Token": self.token},
+            json=payload,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if not body.get("result"):
+            raise RuntimeError(f"CJ createOrder failed: {body}")
+        return body
+
+    def query_order(self, cj_order_id: str) -> dict:
+        return self.get("/shopping/order/getOrderDetail", {"orderId": cj_order_id})
+```
+
+---
+
+## clients/woo_client.py
+
+```python
+import os
+import requests
+from woocommerce import API
+
+from config import cfg
+from models import NormalizedProduct
+from db import get_conn
+
+
+wcapi = API(
+    url=cfg.wc_url,
+    consumer_key=cfg.wc_ck,
+    consumer_secret=cfg.wc_cs,
+    version="wc/v3",
+    timeout=60,
+)
+
+
+def _chunks(seq, n):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
+def _extract_attributes(variants):
+    options: dict[str, set] = {}
+    for v in variants:
+        for k, val in v.options.items():
+            options.setdefault(k, set()).add(val)
+    return [
+        {"name": k, "visible": True, "variation": True, "options": sorted(vals)}
+        for k, vals in options.items()
+    ]
+
+
+def create_product(p: NormalizedProduct, canonical_sku: str) -> dict:
+    attributes = _extract_attributes(p.variants)
+    payload = {
+        "name": p.title,
+        "type": "variable" if len(p.variants) > 1 else "simple",
+        "status": "draft",
+        "description": p.description_html,
+        "images": [{"src": u} for u in p.images],
+        "attributes": attributes,
+    }
+    if len(p.variants) == 1:
+        v = p.variants[0]
+        payload.update({
+            "regular_price": str(v.price),
+            "sku": v.supplier_sku,
+            "manage_stock": True,
+            "stock_quantity": v.stock,
+        })
+
+    resp = wcapi.post("products", payload)
+    resp.raise_for_status()
+    product = resp.json()
+
+    if len(p.variants) > 1:
+        _create_variations(product["id"], p.variants, attributes, canonical_sku)
+    else:
+        _record_channel_variant(
+            canonical_sku, "woocommerce",
+            str(product["id"]), str(product["id"]),
+            product.get("sku"), p.variants[0].stock,
+        )
+
+    return product
+
+
+def _create_variations(product_id: int, variants, attributes, canonical_sku: str):
+    attr_names = [a["name"] for a in attributes]
+    items = [{
+        "regular_price": str(v.price),
+        "sku": v.supplier_sku,
+        "manage_stock": True,
+        "stock_quantity": v.stock,
+        "attributes": [
+            {"name": name, "option": v.options[name]}
+            for name in attr_names if name in v.options
+        ],
+    } for v in variants]
+
+    for chunk in _chunks(items, 100):
+        resp = wcapi.post(f"products/{product_id}/variations/batch", {"create": chunk})
+        resp.raise_for_status()
+        created = resp.json().get("create", [])
+        for c in created:
+            _record_channel_variant(
+                canonical_sku, "woocommerce", str(product_id), str(c["id"]),
+                c.get("sku"), 0,
+            )
+
+
+def _record_channel_variant(canonical_sku, channel, product_id, variant_id, sku, qty):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO channel_variants
+               (canonical_sku, channel, channel_product_id,
+                channel_variant_id, channel_sku, last_pushed_qty)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (canonical_sku, channel, product_id, variant_id, sku, qty),
+        )
+
+
+def batch_update_variations(product_id: int, updates: list[dict]) -> None:
+    for chunk in _chunks(updates, 100):
+        resp = wcapi.post(
+            f"products/{product_id}/variations/batch", {"update": chunk}
+        )
+        resp.raise_for_status()
+
+
+def set_listing_visibility(product_id: int, visible: bool) -> dict:
+    resp = wcapi.put(
+        f"products/{product_id}",
+        {"catalog_visibility": "visible" if visible else "hidden"},
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def list_orders(status: str = "processing", page: int = 1) -> list[dict]:
+    resp = wcapi.get("orders", params={"status": status, "per_page": 100, "page": page})
+    resp.raise_for_status()
+    return resp.json()
+
+
+def push_order_note(order_id: int, note: str) -> dict:
+    resp = wcapi.post(
+        f"orders/{order_id}/notes",
+        {"note": note, "customer_note": False},
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def update_order_status(order_id: int, status: str) -> dict:
+    resp = wcapi.put(f"orders/{order_id}", {"status": status})
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ---- 리뷰 ----
+def list_reviews(product_id: int | None = None) -> list[dict]:
+    params = {"per_page": 100}
+    if product_id:
+        params["product"] = product_id
+    resp = requests.get(
+        f"{cfg.wc_url}/wp-json/wc/v3/products/reviews",
+        params=params,
+        auth=(cfg.wc_ck, cfg.wc_cs),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def reply_to_review(review_id: int, body: str) -> dict:
+    resp = requests.post(
+        f"{cfg.wc_url}/wp-json/wp/v2/comments",
+        auth=(cfg.wp_user, cfg.wp_app_password),
+        json={"content": body, "parent": review_id, "status": "approve"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+```
+
+---
+
+## clients/shopify_client.py
+
+```python
+import time
+import requests
+
+from config import cfg
+
+
+class ShopifyClient:
+    def __init__(self):
+        self.url = (
+            f"https://{cfg.shopify_shop}/admin/api/"
+            f"{cfg.shopify_api_version}/graphql.json"
+        )
+        self.session = requests.Session()
+        self.session.headers.update({
+            "X-Shopify-Access-Token": cfg.shopify_token,
+            "Content-Type": "application/json",
+        })
+        self.available = 1000
+        self.restore = 100
+
+    def execute(self, query: str, variables: dict | None = None) -> dict:
+        for _ in range(5):
+            resp = self.session.post(
+                self.url,
+                json={"query": query, "variables": variables or {}},
+                timeout=60,
+            )
+            if resp.status_code == 429:
+                time.sleep(2)
+                continue
+            resp.raise_for_status()
+            body = resp.json()
+            cost = body.get("extensions", {}).get("cost", {})
+            if cost:
+                ts = cost.get("throttleStatus", {})
+                self.available = ts.get("currentlyAvailable", self.available)
+                self.restore = ts.get("restoreRate", self.restore)
+            if body.get("errors"):
+                raise RuntimeError(body["errors"])
+            return body["data"]
+        raise RuntimeError("Shopify retries exhausted")
+
+    def wait_for_budget(self, need: int):
+        while self.available < need:
+            time.sleep(1)
+            self.available = min(1000, self.available + self.restore)
+
+
+PRODUCT_CREATE = """
+mutation ProductCreate($input: ProductInput!) {
+  productCreate(input: $input) {
+    product { id title }
+    userErrors { field message }
+  }
+}
+"""
+
+VARIANTS_BULK_CREATE = """
+mutation VariantsBulkCreate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+  productVariantsBulkCreate(productId: $productId, variants: $variants) {
+    productVariants { id sku inventoryItem { id } }
+    userErrors { field message }
+  }
+}
+"""
+
+INVENTORY_ADJUST = """
+mutation Adjust($input: InventoryAdjustQuantitiesInput!) {
+  inventoryAdjustQuantities(input: $input) {
+    inventoryAdjustmentGroup { createdAt reason }
+    userErrors { field message }
+  }
+}
+"""
+
+PUBLICATIONS_QUERY = """
+query { publications(first: 20) { nodes { id catalog { title } } } }
+"""
+
+PUBLISH = """
+mutation($id: ID!, $input: [PublicationInput!]!) {
+  publishablePublish(id: $id, input: $input) {
+    userErrors { field message }
+  }
+}
+"""
+
+UNPUBLISH = """
+mutation($id: ID!, $input: [PublicationInput!]!) {
+  publishableUnpublish(id: $id, input: $input) {
+    userErrors { field message }
+  }
+}
+"""
+
+ORDERS_QUERY = """
+query Orders($cursor: String) {
+  orders(first: 50, after: $cursor,
+         query: "fulfillment_status:unfulfilled AND status:open") {
+    edges {
+      node {
+        id name displayFinancialStatus
+        totalPriceSet { shopMoney { amount currencyCode } }
+        email
+        shippingAddress { address1 city province country zip phone name countryCodeV2 }
+        lineItems(first: 50) {
+          edges { node {
+            id quantity sku name
+            originalUnitPriceSet { shopMoney { amount } }
+          } }
+        }
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+FULFILLMENT_ORDERS = """
+query($orderId: ID!) {
+  order(id: $orderId) {
+    fulfillmentOrders(first: 10) {
+      edges { node {
+        id status
+        lineItems(first: 50) {
+          edges { node { id remainingQuantity lineItem { id } } }
+        }
+      } }
+    }
+  }
+}
+"""
+
+FULFILLMENT_CREATE = """
+mutation($fulfillment: FulfillmentInput!) {
+  fulfillmentCreate(fulfillment: $fulfillment) {
+    fulfillment { id status trackingInfo { number url } }
+    userErrors { field message }
+  }
+}
+"""
+
+
+def create_product(client: ShopifyClient, p, canonical_sku: str) -> dict:
+    data = client.execute(PRODUCT_CREATE, {
+        "input": {
+            "title": p.title,
+            "descriptionHtml": p.description_html,
+            "status": "DRAFT",
+            "tags": p.tags,
+        }
+    })
+    errs = data["productCreate"]["userErrors"]
+    if errs:
+        raise RuntimeError(errs)
+    product_gid = data["productCreate"]["product"]["id"]
+
+    variants_input = [{
+        "price": str(v.price),
+        "sku": v.supplier_sku,
+        "optionValues": [
+            {"optionName": k, "name": val} for k, val in v.options.items()
+        ],
+        "inventoryQuantities": [{
+            "locationId": cfg.shopify_location_id,
+            "name": "available",
+            "quantity": v.stock,
+        }],
+    } for v in p.variants]
+
+    created = []
+    for i in range(0, len(variants_input), 250):
+        chunk = variants_input[i:i + 250]
+        d = client.execute(VARIANTS_BULK_CREATE, {
+            "productId": product_gid,
+            "variants": chunk,
+        })
+        e = d["productVariantsBulkCreate"]["userErrors"]
+        if e:
+            raise RuntimeError(e)
+        created.extend(d["productVariantsBulkCreate"]["productVariants"])
+
+    _record_variants(canonical_sku, product_gid, created, p)
+    return {"product_gid": product_gid, "variants": created}
+
+
+def _record_variants(canonical_sku, product_gid, created, p):
+    from db import get_conn
+    with get_conn() as conn:
+        for idx, c in enumerate(created):
+            supplier_sku = c.get("sku") or (
+                p.variants[idx].supplier_sku if idx < len(p.variants) else ""
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO channel_variants
+                   (canonical_sku, channel, channel_product_id,
+                    channel_variant_id, channel_sku, inventory_item_id,
+                    last_pushed_qty)
+                   VALUES (?, 'shopify', ?, ?, ?, ?, ?)""",
+                (
+                    canonical_sku, product_gid, c["id"], supplier_sku,
+                    c["inventoryItem"]["id"],
+                    p.variants[idx].stock if idx < len(p.variants) else 0,
+                ),
+            )
+
+
+def adjust_inventory(client: ShopifyClient, inventory_item_gid: str,
+                     delta: int, reason: str = "correction"):
+    if delta == 0:
+        return
+    d = client.execute(INVENTORY_ADJUST, {
+        "input": {
+            "reason": reason,
+            "name": "available",
+            "changes": [{
+                "delta": delta,
+                "inventoryItemId": inventory_item_gid,
+                "locationId": cfg.shopify_location_id,
+            }],
+        }
+    })
+    errs = d["inventoryAdjustQuantities"]["userErrors"]
+    if errs:
+        raise RuntimeError(errs)
+
+
+def list_publications(client: ShopifyClient) -> list[dict]:
+    return client.execute(PUBLICATIONS_QUERY)["publications"]["nodes"]
+
+
+def set_listing(client: ShopifyClient, product_gid: str,
+                publication_ids: list[str], visible: bool):
+    inputs = [{"publicationId": pid} for pid in publication_ids]
+    mutation = PUBLISH if visible else UNPUBLISH
+    d = client.execute(mutation, {"id": product_gid, "input": inputs})
+    key = "publishablePublish" if visible else "publishableUnpublish"
+    if d[key]["userErrors"]:
+        raise RuntimeError(d[key]["userErrors"])
+
+
+def collect_orders(client: ShopifyClient) -> list[dict]:
+    out = []
+    cursor = None
+    while True:
+        data = client.execute(ORDERS_QUERY, {"cursor": cursor})
+        page = data["orders"]
+        out.extend([e["node"] for e in page["edges"]])
+        if not page["pageInfo"]["hasNextPage"]:
+            break
+        cursor = page["pageInfo"]["endCursor"]
+    return out
+
+
+def fulfill_order(client: ShopifyClient, order_gid: str,
+                  tracking_number: str, tracking_url: str, carrier: str):
+    fo = client.execute(FULFILLMENT_ORDERS, {"orderId": order_gid})
+    fos = [e["node"] for e in fo["order"]["fulfillmentOrders"]["edges"]]
+    if not fos:
+        raise RuntimeError("no fulfillment orders")
+
+    line_items = []
+    for f in fos:
+        for li in f["lineItems"]["edges"]:
+            node = li["node"]
+            if node["remainingQuantity"] <= 0:
+                continue
+            line_items.append({
+                "fulfillmentOrderId": f["id"],
+                "fulfillmentOrderLineItems": [{
+                    "id": node["id"],
+                    "quantity": node["remainingQuantity"],
+                }],
+            })
+    if not line_items:
+        raise RuntimeError("nothing to fulfill")
+
+    d = client.execute(FULFILLMENT_CREATE, {
+        "fulfillment": {
+            "lineItemsByFulfillmentOrder": line_items,
+            "trackingInfo": {
+                "number": tracking_number,
+                "url": tracking_url,
+                "company": carrier,
+            },
+            "notifyCustomer": False,
+        }
+    })
+    errs = d["fulfillmentCreate"]["userErrors"]
+    if errs:
+        raise RuntimeError(errs)
+    return d["fulfillmentCreate"]["fulfillment"]
+```
+
+---
+
+## services/normalizer.py
+
+```python
+from decimal import Decimal
+from models import NormalizedProduct, Variant
+
+
+def build_normalized(cj_raw: dict, sku_data: dict) -> NormalizedProduct:
+    variants = []
+    for v in sku_data.get("variants", []):
+        options = {}
+        std = v.get("variantStandard") or {}
+        if isinstance(std, dict):
+            options = {k: str(val) for k, val in std.items()}
+        variants.append(Variant(
+            supplier_sku=v["variantSku"],
+            supplier_vid=str(v.get("vid", "")),
+            price=Decimal(str(v.get("variantSellPrice", "0"))),
+            stock=int(v.get("variantInventory", 0) or 0),
+            options=options,
+            image=v.get("variantImage"),
+        ))
+
+    images = []
+    if cj_raw.get("productImage"):
+        images.append(cj_raw["productImage"])
+    for extra in cj_raw.get("productImageSet", []) or []:
+        if extra not in images:
+            images.append(extra)
+
+    return NormalizedProduct(
+        supplier="cj",
+        supplier_pid=str(cj_raw["pid"]),
+        title=cj_raw.get("productNameEn", ""),
+        description_html=cj_raw.get("description", "") or "",
+        images=images,
+        variants=variants,
+        category=cj_raw.get("categoryName"),
+        tags=[t for t in (cj_raw.get("tags") or []) if isinstance(t, str)],
+    )
+```
+
+---
+
+## services/pricing.py
+
+```python
+from decimal import Decimal, ROUND_HALF_UP
+from config import cfg
+
+
+def compute_sell_price(supplier_price: Decimal, freight: Decimal = Decimal("0")) -> Decimal:
+    base = supplier_price + freight
+    with_margin = base * (Decimal("1") + cfg.pricing_margin)
+    # .99 로 끝나는 반올림
+    integer = with_margin.to_integral_value(rounding=ROUND_HALF_UP)
+    candidate = (integer - Decimal("0.01")).quantize(Decimal("0.01"))
+    if candidate < with_margin:
+        candidate = integer.quantize(Decimal("0.01"))
+    return candidate.quantize(Decimal("0.01"))
+
+
+def assert_positive_margin(sell: Decimal, cost: Decimal) -> None:
+    if sell <= cost:
+        raise ValueError(f"negative margin: sell={sell} cost={cost}")
+```
+
+---
+
+## services/product_sync.py
+
+```python
+import logging
+
+from clients.cj_client import CJClient
+from clients import woo_client, shopify_client
+from db import get_conn
+from models import NormalizedProduct
+from services.normalizer import build_normalized
+from services.pricing import compute_sell_price
+from utils.audit import append_audit
+
+log = logging.getLogger(__name__)
+shopify = shopify_client.ShopifyClient()
+
+
+def _apply_pricing(p: NormalizedProduct) -> NormalizedProduct:
+    for v in p.variants:
+        v.price = compute_sell_price(v.price)
+    return p
+
+
+def sync_one(cj_raw: dict, cj: CJClient) -> dict:
+    pid = str(cj_raw["pid"])
+    sku_data = cj.variant_query(pid)
+    normalized = build_normalized(cj_raw, sku_data)
+    if not normalized.variants:
+        return {"skipped": "no_variants"}
+
+    _apply_pricing(normalized)
+    canonical = normalized.canonical_sku
+
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO canonical_products (canonical_sku, title) "
+            "VALUES (?, ?)",
+            (canonical, normalized.title),
+        )
+        for v in normalized.variants:
+            conn.execute(
+                """INSERT OR REPLACE INTO supplier_products
+                   (supplier, supplier_pid, supplier_sku, supplier_vid, raw_json, last_synced)
+                   VALUES ('cj', ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                (pid, v.supplier_sku, v.supplier_vid, str(cj_raw)),
+            )
+            conn.execute(
+                """INSERT OR REPLACE INTO mapping
+                   (canonical_sku, supplier, supplier_sku, priority, verified)
+                   VALUES (?, 'cj', ?, 1, 1)""",
+                (canonical, v.supplier_sku),
+            )
+
+    results = {}
+    for name, fn in (("woocommerce", woo_client.create_product),
+                     ("shopify", lambda p, c: shopify_client.create_product(shopify, p, c))):
+        try:
+            out = fn(normalized, canonical)
+            results[name] = "ok"
+            append_audit("system", "product.create",
+                         f"{name}:{canonical}", after={"id": str(out)[:120]})
+        except Exception as e:
+            log.exception("upload %s failed: %s", name, e)
+            results[name] = f"error: {e}"
+    return results
+
+
+def sync_by_keyword(keyword: str, pages: int = 1):
+    cj = CJClient()
+    for page in range(1, pages + 1):
+        for raw in cj.list_products(keyword, page=page):
+            log.info("syncing %s", raw.get("productNameEn"))
+            yield sync_one(raw, cj)
+```
+
+---
+
+## services/inventory_sync.py
+
+```python
+import logging
+from clients.cj_client import CJClient
+from clients import woo_client, shopify_client
+from db import get_conn
+
+log = logging.getLogger(__name__)
+shopify = shopify_client.ShopifyClient()
+
+
+def sync_inventory(stale_minutes: int = 30) -> dict:
+    cj = CJClient()
+    summary = {"updated": 0, "errors": 0}
+
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT cv.*, sp.supplier_vid, sp.supplier_sku, sp.supplier_pid
+            FROM channel_variants cv
+            JOIN mapping m ON m.canonical_sku = cv.canonical_sku
+            JOIN supplier_products sp ON sp.supplier_sku = m.supplier_sku
+        """).fetchall()
+
+    by_pid: dict[str, list] = {}
+    for r in rows:
+        by_pid.setdefault(r["supplier_pid"], []).append(r)
+
+    for pid, variants in by_pid.items():
+        try:
+            data = cj.variant_query(pid)
+        except Exception as e:
+            log.error("variant_query %s failed: %s", pid, e)
+            summary["errors"] += 1
+            continue
+
+        stock_by_sku = {
+            v["variantSku"]: int(v.get("variantInventory", 0) or 0)
+            for v in data.get("variants", [])
+        }
+
+        woo_by_product: dict[int, list] = {}
+        for r in variants:
+            new_qty = stock_by_sku.get(r["supplier_sku"])
+            if new_qty is None:
+                continue
+            if r["channel"] == "woocommerce":
+                woo_by_product.setdefault(int(r["channel_product_id"]), []).append(
+                    {"id": int(r["channel_variant_id"]),
+                     "manage_stock": True,
+                     "stock_quantity": new_qty}
+                )
+            elif r["channel"] == "shopify":
+                delta = new_qty - (r["last_pushed_qty"] or 0)
+                try:
+                    shopify_client.adjust_inventory(
+                        shopify, r["inventory_item_id"], delta
+                    )
+                    _save_pushed(r["id"], new_qty)
+                    summary["updated"] += 1
+                except Exception as e:
+                    log.error("shopify inventory %s: %s", r["id"], e)
+                    summary["errors"] += 1
+
+        for product_id, updates in woo_by_product.items():
+            try:
+                woo_client.batch_update_variations(product_id, updates)
+                for u in updates:
+                    _save_pushed_by_variant("woocommerce", str(u["id"]), u["stock_quantity"])
+                summary["updated"] += len(updates)
+            except Exception as e:
+                log.error("woo batch %s: %s", product_id, e)
+                summary["errors"] += 1
+
+    return summary
+
+
+def _save_pushed(row_id: int, qty: int):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE channel_variants SET last_pushed_qty = ? WHERE id = ?",
+            (qty, row_id),
+        )
+
+
+def _save_pushed_by_variant(channel: str, variant_id: str, qty: int):
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE channel_variants SET last_pushed_qty = ?
+               WHERE channel = ? AND channel_variant_id = ?""",
+            (qty, channel, variant_id),
+        )
+```
+
+---
+
+## services/order_service.py
+
+```python
+import json
+import logging
+import sqlite3
+import uuid
+from decimal import Decimal
+
+from clients.cj_client import CJClient
+from clients import woo_client, shopify_client
+from db import get_conn
+from utils.audit import append_audit
+
+log = logging.getLogger(__name__)
+shopify = shopify_client.ShopifyClient()
+
+
+def collect_woo() -> int:
+    n = 0
+    orders = woo_client.list_orders()
+    for o in orders:
+        _upsert_order(
+            channel="woocommerce",
+            channel_order_id=str(o["id"]),
+            channel_order_num=o.get("number"),
+            status=o.get("status"),
+            financial_status=o.get("status"),
+            total=o.get("total"),
+            currency=o.get("currency"),
+            email=o.get("billing", {}).get("email"),
+            shipping_address=o.get("shipping", {}),
+            raw=o,
+            items=[{
+                "channel_line_id": str(li["id"]),
+                "supplier_sku": li.get("sku"),
+                "quantity": li["quantity"],
+                "unit_price": li.get("price"),
+            } for li in o.get("line_items", [])],
+        )
+        n += 1
+    return n
+
+
+def collect_shopify() -> int:
+    n = 0
+    for o in shopify_client.collect_orders(shopify):
+        addr = o.get("shippingAddress") or {}
+        _upsert_order(
+            channel="shopify",
+            channel_order_id=o["id"],
+            channel_order_num=o.get("name"),
+            status="open",
+            financial_status=o.get("displayFinancialStatus"),
+            total=o["totalPriceSet"]["shopMoney"]["amount"],
+            currency=o["totalPriceSet"]["shopMoney"]["currencyCode"],
+            email=o.get("email"),
+            shipping_address=addr,
+            raw=o,
+            items=[{
+                "channel_line_id": e["node"]["id"],
+                "supplier_sku": e["node"].get("sku"),
+                "quantity": e["node"]["quantity"],
+                "unit_price": e["node"]["originalUnitPriceSet"]["shopMoney"]["amount"],
+            } for e in o["lineItems"]["edges"]],
+        )
+        n += 1
+    return n
+
+
+def _upsert_order(channel, channel_order_id, channel_order_num, status,
+                  financial_status, total, currency, email, shipping_address,
+                  raw, items):
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO orders
+            (channel, channel_order_id, channel_order_num, status,
+             financial_status, total, currency, customer_email,
+             shipping_address, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            channel, channel_order_id, channel_order_num, status,
+            financial_status, total, currency, email,
+            json.dumps(shipping_address, default=str), json.dumps(raw, default=str),
+        ))
+        order_row = conn.execute(
+            "SELECT id FROM orders WHERE channel = ? AND channel_order_id = ?",
+            (channel, channel_order_id),
+        ).fetchone()
+        oid = order_row["id"]
+
+        conn.execute("DELETE FROM order_items WHERE order_id = ?", (oid,))
+        for it in items:
+            mapped = 1 if _resolve_mapping(it["supplier_sku"]) else 0
+            conn.execute("""
+                INSERT INTO order_items
+                (order_id, channel_line_id, supplier_sku, quantity, unit_price, mapped)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (oid, it["channel_line_id"], it["supplier_sku"],
+                  it["quantity"], it["unit_price"], mapped))
+
+
+def _resolve_mapping(supplier_sku: str | None) -> dict | None:
+    if not supplier_sku:
+        return None
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM mapping WHERE supplier_sku = ? ORDER BY priority LIMIT 1",
+            (supplier_sku,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def preview_order(order_id: int) -> dict:
+    with get_conn() as conn:
+        order = conn.execute(
+            "SELECT * FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        items = conn.execute(
+            "SELECT * FROM order_items WHERE order_id = ?", (order_id,)
+        ).fetchall()
+        cj = conn.execute(
+            "SELECT * FROM cj_orders WHERE local_order_id = ?", (order_id,)
+        ).fetchone()
+    if not order:
+        raise ValueError("order not found")
+    return {
+        "order": dict(order),
+        "items": [dict(i) for i in items],
+        "cj_order": dict(cj) if cj else None,
+    }
+
+
+def _build_cj_payload(order_row: dict, items: list[dict], is_sandbox: int) -> dict:
+    products = []
+    for it in items:
+        mapping = _resolve_mapping(it["supplier_sku"])
+        if not mapping:
+            raise ValueError(f"unmapped supplier_sku: {it['supplier_sku']}")
+        with get_conn() as conn:
+            sp = conn.execute(
+                "SELECT supplier_vid FROM supplier_products WHERE supplier_sku = ?",
+                (it["supplier_sku"],),
+            ).fetchone()
+        if not sp or not sp["supplier_vid"]:
+            raise ValueError(f"missing vid for {it['supplier_sku']}")
+        products.append({
+            "vid": sp["supplier_vid"],
+            "quantity": str(it["quantity"]),
+            "shippingName": it["supplier_sku"],
+        })
+
+    addr = json.loads(order_row["shipping_address"]) if order_row["shipping_address"] else {}
+    return {
+        "orderNumber": f"LOCAL-{order_row['id']}-{uuid.uuid4().hex[:8]}",
+        "shippingCountryCode": addr.get("country", "")[:2].upper(),
+        "shippingCountry": addr.get("country", ""),
+        "shippingProvince": addr.get("state", addr.get("province", "")),
+        "shippingCity": addr.get("city", ""),
+        "shippingAddress": addr.get("address_1", addr.get("address1", "")),
+        "shippingAddress2": addr.get("address_2", addr.get("address2", "")),
+        "shippingCustomerName": f"{addr.get('first_name', '')} {addr.get('last_name', '')}".strip()
+                                 or addr.get("name", ""),
+        "shippingZip": addr.get("postcode", addr.get("zip", "")),
+        "shippingPhone": addr.get("phone", ""),
+        "logisticName": order_row.get("preferred_logistic") or "CJPacket Ordinary",
+        "fromCountryCode": "CN",
+        "remark": f"{order_row['channel']} / {order_row['channel_order_num']}",
+        "isSandbox": is_sandbox,
+        "products": products,
+    }
+
+
+def sandbox_preview(order_id: int) -> dict:
+    p = preview_order(order_id)
+    cj = CJClient()
+    payload = _build_cj_payload(p["order"], p["items"], is_sandbox=1)
+    resp = cj.session.post(
+        f"{cj_base()}/shopping/order/createOrder",
+        headers={"CJ-Access-Token": cj.token},
+        json=payload,
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def cj_base() -> str:
+    from config import cfg
+    return cfg.cj_base
+
+
+def place_order(order_id: int) -> dict:
+    # 1) PENDING 선기록
+    with get_conn() as conn:
+        try:
+            conn.execute(
+                """INSERT INTO cj_orders (local_order_id, cj_order_number, status)
+                   VALUES (?, ?, 'PENDING')""",
+                (order_id, f"PENDING-{order_id}"),
+            )
+        except sqlite3.IntegrityError:
+            row = conn.execute(
+                "SELECT * FROM cj_orders WHERE local_order_id = ?", (order_id,)
+            ).fetchone()
+            return {"skipped": "already_exists", "status": row["status"] if row else None}
+
+    p = preview_order(order_id)
+    payload = _build_cj_payload(p["order"], p["items"], is_sandbox=0)
+
+    cj = CJClient()
+    result = cj.create_order(payload)
+
+    cj_order_id = str(result.get("data"))
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE cj_orders
+               SET cj_order_id = ?, cj_order_number = ?, status = 'CREATED',
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE local_order_id = ?""",
+            (cj_order_id, payload["orderNumber"], order_id),
+        )
+
+    append_audit("system", "cj.order.create", f"order:{order_id}",
+                 after={"cj_order_id": cj_order_id})
+
+    if p["order"]["channel"] == "woocommerce":
+        woo_client.push_order_note(int(p["order"]["channel_order_id"]),
+                                   f"CJ order {cj_order_id} created")
+        woo_client.update_order_status(int(p["order"]["channel_order_id"]), "processing")
+
+    return {"cj_order_id": cj_order_id, "status": "CREATED"}
+
+
+def push_tracking(order_id: int) -> dict:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM cj_orders WHERE local_order_id = ?", (order_id,)
+        ).fetchone()
+        order = conn.execute(
+            "SELECT * FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+    if not row or not row["cj_order_id"]:
+        raise ValueError("no cj order")
+
+    cj = CJClient()
+    detail = cj.query_order(row["cj_order_id"])
+    tracking = detail.get("trackNumber") or detail.get("trackingNumber")
+    carrier = detail.get("logisticName") or row["logistic_name"] or "CJ"
+
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE cj_orders SET tracking_number = ?, logistic_name = ?,
+               status = 'SHIPPED', updated_at = CURRENT_TIMESTAMP
+               WHERE local_order_id = ?""",
+            (tracking, carrier, order_id),
+        )
+
+    if not tracking:
+        return {"status": "no_tracking"}
+
+    if order["channel"] == "shopify":
+        shopify_client.fulfill_order(
+            shopify, order["channel_order_id"], tracking,
+            f"https://t.17track.net/en#nums={tracking}", carrier,
+        )
+    else:
+        woo_client.push_order_note(int(order["channel_order_id"]),
+                                   f"Tracking: {tracking} ({carrier})")
+
+    append_audit("system", "order.tracking.push", f"order:{order_id}",
+                 after={"tracking": tracking, "carrier": carrier})
+    return {"tracking": tracking, "carrier": carrier}
+```
+
+---
+
+## services/listing_service.py
+
+```python
+from clients import woo_client, shopify_client
+from db import get_conn
+from utils.audit import append_audit
+
+shopify = shopify_client.ShopifyClient()
+
+
+def set_listing(canonical_sku: str, channels: list[str], visible: bool) -> dict:
+    out = {}
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM channel_variants WHERE canonical_sku = ?", (canonical_sku,)
+        ).fetchall()
+    if not rows:
+        raise ValueError(f"no channel variants for {canonical_sku}")
+
+    publication_ids = None
+    if "shopify" in channels:
+        publication_ids = [p["id"] for p in shopify_client.list_publications(shopify)]
+
+    seen = set()
+    for r in rows:
+        if r["channel"] not in channels:
+            continue
+        key = (r["channel"], r["channel_product_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if r["channel"] == "woocommerce":
+                woo_client.set_listing_visibility(int(r["channel_product_id"]), visible)
+            elif r["channel"] == "shopify":
+                shopify_client.set_listing(
+                    shopify, r["channel_product_id"], publication_ids, visible
+                )
+            out[f"{r['channel']}:{r['channel_product_id']}"] = "ok"
+            append_audit("system", "listing.set", f"{r['channel']}:{canonical_sku}",
+                         after={"visible": visible})
+        except Exception as e:
+            out[f"{r['channel']}:{r['channel_product_id']}"] = f"error: {e}"
+    return out
+```
+
+---
+
+## services/comment_service.py
+
+```python
+import json
+import logging
+from clients import woo_client
+from db import get_conn
+from utils.audit import append_audit
+
+log = logging.getLogger(__name__)
+
+
+def sync_woo_reviews() -> int:
+    n = 0
+    for r in woo_client.list_reviews():
+        with get_conn() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO comments
+                (channel, channel_comment_id, product_ref, author, body,
+                 rating, status, parent_id, created_at, raw_json)
+                VALUES ('woocommerce', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                str(r["id"]), str(r.get("product_id")), r.get("reviewer"),
+                r.get("review", ""), int(r.get("rating") or 0),
+                "approved" if r.get("status") == "approved" else "pending",
+                str(r.get("parent", 0)) if r.get("parent") else None,
+                r.get("date_created"), json.dumps(r, default=str),
+            ))
+        n += 1
+    return n
+
+
+def draft_reply(comment_id: int, body: str) -> None:
+    with get_conn() as conn:
+        c = conn.execute("SELECT * FROM comments WHERE id = ?", (comment_id,)).fetchone()
+        if not c:
+            raise ValueError("comment not found")
+        conn.execute("""
+            INSERT OR REPLACE INTO comment_replies
+            (comment_id, channel, body, status)
+            VALUES (?, ?, ?, 'draft')
+        """, (comment_id, c["channel"], body))
+
+
+def send_reply(comment_id: int) -> dict:
+    with get_conn() as conn:
+        c = conn.execute("SELECT * FROM comments WHERE id = ?", (comment_id,)).fetchone()
+        r = conn.execute(
+            "SELECT * FROM comment_replies WHERE comment_id = ?", (comment_id,)
+        ).fetchone()
+    if not c or not r:
+        raise ValueError("missing comment or draft")
+    if r["status"] == "sent":
+        return {"skipped": "already_sent"}
+
+    if c["channel"] != "woocommerce":
+        raise NotImplementedError("Shopify 리뷰는 앱 어댑터 필요")
+
+    resp = woo_client.reply_to_review(int(c["channel_comment_id"]), r["body"])
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE comment_replies SET channel_reply_id = ?, status = 'sent' "
+            "WHERE comment_id = ?",
+            (str(resp["id"]), comment_id),
+        )
+    append_audit("system", "comment.reply.send", f"comment:{comment_id}",
+                 after={"reply_id": resp["id"]})
+    return {"reply_id": resp["id"]}
+```
+
+---
+
+## webhook/receiver.py
+
+```python
+import hashlib
+import json
+import logging
+
+from fastapi import FastAPI, Request, HTTPException
+
+from db import get_conn
+from utils.security import verify_cj, verify_shopify
+
+log = logging.getLogger(__name__)
+app = FastAPI(title="Dropship Webhook Receiver", docs_url=None, redoc_url=None)
+
+
+def _record(provider: str, delivery_id: str, topic: str | None) -> bool:
+    """중복 배송 차단. 새 이벤트면 True."""
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO webhook_events (provider, delivery_id, topic)
+                   VALUES (?, ?, ?)""",
+                (provider, delivery_id, topic),
+            )
+        return True
+    except Exception:
+        return False
+
+
+@app.post("/webhooks/cj")
+async def cj_webhook(request: Request):
+    raw = await request.body()
+    sign = request.headers.get("sign", "")
+    if not verify_cj(raw, sign):
+        raise HTTPException(401, "invalid signature")
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "invalid json")
+
+    delivery_id = hashlib.sha256(raw).hexdigest()
+    topic = body.get("type") or body.get("topic")
+    if not _record("cj", delivery_id, topic):
+        return {"ok": True, "duplicate": True}
+
+    # 백그라운드 워커로 위임 (여기서는 로그만)
+    log.info("cj webhook %s received", topic)
+    return {"ok": True}
+
+
+@app.post("/webhooks/shopify")
+async def shopify_webhook(request: Request):
+    raw = await request.body()
+    hmac_header = request.headers.get("X-Shopify-Hmac-SHA256", "")
+    if not verify_shopify(raw, hmac_header):
+        raise HTTPException(401, "invalid signature")
+
+    delivery_id = request.headers.get("X-Shopify-Webhook-Id", "")
+    if not delivery_id:
+        delivery_id = hashlib.sha256(raw).hexdigest()
+    topic = request.headers.get("X-Shopify-Topic")
+    if not _record("shopify", delivery_id, topic):
+        return {"ok": True, "duplicate": True}
+
+    log.info("shopify webhook %s received", topic)
+    return {"ok": True}
+```
+
+---
+
+## preview/app.py
+
+```python
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
+
+from db import get_conn
+from services import order_service
+from utils.security import require_api_key
+
+app = FastAPI(
+    title="Dropship Preview",
+    docs_url=None,
+    redoc_url=None,
+    dependencies=[Depends(require_api_key)],
+)
+templates = Jinja2Templates(directory="preview/templates")
+
+
+@app.get("/orders/{order_id}", response_class=HTMLResponse)
+def preview_order(request: Request, order_id: int):
+    try:
+        data = order_service.preview_order(order_id)
+    except ValueError:
+        raise HTTPException(404)
+    return templates.TemplateResponse(
+        "order.html", {"request": request, **data}
+    )
+
+
+@app.get("/api/orders/{order_id}")
+def api_order(order_id: int):
+    try:
+        return order_service.preview_order(order_id)
+    except ValueError:
+        raise HTTPException(404)
+
+
+@app.get("/api/products/{canonical_sku}")
+def api_product(canonical_sku: str):
+    with get_conn() as conn:
+        prod = conn.execute(
+            "SELECT * FROM canonical_products WHERE canonical_sku = ?",
+            (canonical_sku,),
+        ).fetchone()
+        variants = conn.execute(
+            "SELECT * FROM channel_variants WHERE canonical_sku = ?",
+            (canonical_sku,),
+        ).fetchall()
+    if not prod:
+        raise HTTPException(404)
+    return {"product": dict(prod), "variants": [dict(v) for v in variants]}
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+```
+
+`preview/templates/order.html`:
+
+```html
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>Order #{{ order.id }}</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; }
+    .unmapped { background: #ffecec; }
+    table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+    th, td { border: 1px solid #ccc; padding: 0.5rem; text-align: left; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; }
+    .ok { background: #d4f4dd; }
+    .warn { background: #ffd9d9; }
+  </style>
+</head>
+<body>
+  <h1>Order #{{ order.id }} — {{ order.channel }} / {{ order.channel_order_num }}</h1>
+  <p>Status: <span class="badge ok">{{ order.status }}</span></p>
+  <p>Total: {{ order.total }} {{ order.currency }}</p>
+  <p>Email: {{ order.customer_email }}</p>
+
+  <h2>Items</h2>
+  <table>
+    <tr><th>Supplier SKU</th><th>Qty</th><th>Unit</th><th>Mapped</th></tr>
+    {% for it in items %}
+    <tr class="{{ '' if it.mapped else 'unmapped' }}">
+      <td>{{ it.supplier_sku or '-' }}</td>
+      <td>{{ it.quantity }}</td>
+      <td>{{ it.unit_price }}</td>
+      <td>
+        {% if it.mapped %}<span class="badge ok">yes</span>
+        {% else %}<span class="badge warn">no</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <h2>CJ Order</h2>
+  {% if cj_order %}
+    <p>{{ cj_order.status }} — {{ cj_order.cj_order_id or '(pending)' }}</p>
+    {% if cj_order.tracking_number %}
+      <p>Tracking: {{ cj_order.tracking_number }} ({{ cj_order.logistic_name }})</p>
+    {% endif %}
+  {% else %}
+    <p>Not placed</p>
+  {% endif %}
+</body>
+</html>
+```
+
+---
+
+## main.py
+
+```python
+import argparse
+import logging
+import sys
+
+import uvicorn
+
+from config import cfg
+from db import init_db
+from utils.logging_setup import setup_logging
+from utils.audit import verify_audit_chain
+
+log = logging.getLogger(__name__)
+
+
+def cmd_preview(args):
+    from preview.app import app
+    uvicorn.run(app, host=cfg.local_bind_host, port=cfg.local_bind_port)
+
+
+def cmd_webhook(args):
+    from webhook.receiver import app
+    uvicorn.run(app, host=cfg.local_bind_host, port=args.port)
+
+
+def cmd_sync_products(args):
+    from services.product_sync import sync_by_keyword
+    for result in sync_by_keyword(args.keyword, pages=args.pages):
+        print(result)
+
+
+def cmd_sync_inventory(args):
+    from services.inventory_sync import sync_inventory
+    print(sync_inventory())
+
+
+def cmd_orders_collect(args):
+    from services import order_service
+    if args.channel in ("all", "woocommerce"):
+        print("woo:", order_service.collect_woo())
+    if args.channel in ("all", "shopify"):
+        print("shopify:", order_service.collect_shopify())
+
+
+def cmd_orders_preview(args):
+    from services.order_service import preview_order
+    import json
+    print(json.dumps(preview_order(args.order_id), indent=2, default=str))
+
+
+def cmd_orders_place(args):
+    from services.order_service import place_order, sandbox_preview
+    if args.sandbox_first:
+        print("sandbox:", sandbox_preview(args.order_id))
+    print("place:", place_order(args.order_id))
+
+
+def cmd_orders_tracking(args):
+    from services.order_service import push_tracking
+    print(push_tracking(args.order_id))
+
+
+def cmd_listing(args):
+    from services.listing_service import set_listing
+    channels = [c.strip() for c in args.channels.split(",")]
+    print(set_listing(args.sku, channels, visible=(args.action == "publish")))
+
+
+def cmd_comments_sync(args):
+    from services.comment_service import sync_woo_reviews
+    print("synced:", sync_woo_reviews())
+
+
+def cmd_comments_draft(args):
+    from services.comment_service import draft_reply
+    draft_reply(args.comment_id, args.body)
+    print("draft saved")
+
+
+def cmd_comments_send(args):
+    from services.comment_service import send_reply
+    print(send_reply(args.comment_id))
+
+
+def cmd_audit_verify(args):
+    print("audit chain valid:", verify_audit_chain())
+
+
+def cmd_doctor(args):
+    print("audit:", verify_audit_chain())
+    from clients.cj_client import CJClient
+    CJClient().token
+    print("cj: token ok")
+    from clients.shopify_client import ShopifyClient
+    ShopifyClient().execute("query { shop { name } }")
+    print("shopify: ok")
+    from clients import woo_client
+    woo_client.wcapi.get("products", params={"per_page": 1})
+    print("woocommerce: ok")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="dropship")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("preview"); sp.set_defaults(func=cmd_preview)
+    sp = sub.add_parser("webhook"); sp.add_argument("--port", type=int, default=8001)
+    sp.set_defaults(func=cmd_webhook)
+
+    sp = sub.add_parser("sync-products")
+    sp.add_argument("--keyword", required=True)
+    sp.add_argument("--pages", type=int, default=1)
+    sp.set_defaults(func=cmd_sync_products)
+
+    sp = sub.add_parser("sync-inventory"); sp.set_defaults(func=cmd_sync_inventory)
+
+    sp = sub.add_parser("orders")
+    osub = sp.add_subparsers(dest="sub", required=True)
+
+    o = osub.add_parser("collect")
+    o.add_argument("--channel", default="all", choices=["all", "woocommerce", "shopify"])
+    o.set_defaults(func=cmd_orders_collect)
+
+    o = osub.add_parser("preview")
+    o.add_argument("--order-id", type=int, required=True)
+    o.set_defaults(func=cmd_orders_preview)
+
+    o = osub.add_parser("place")
+    o.add_argument("--order-id", type=int, required=True)
+    o.add_argument("--sandbox-first", action="store_true")
+    o.set_defaults(func=cmd_orders_place)
+
+    o = osub.add_parser("push-tracking")
+    o.add_argument("--order-id", type=int, required=True)
+    o.set_defaults(func=cmd_orders_tracking)
+
+    sp = sub.add_parser("listing")
+    sp.add_argument("action", choices=["publish", "hide"])
+    sp.add_argument("--sku", required=True)
+    sp.add_argument("--channels", default="shopify,woocommerce")
+    sp.set_defaults(func=cmd_listing)
+
+    sp = sub.add_parser("comments")
+    csub = sp.add_subparsers(dest="sub", required=True)
+
+    c = csub.add_parser("sync"); c.set_defaults(func=cmd_comments_sync)
+
+    c = csub.add_parser("draft-reply")
+    c.add_argument("--comment-id", type=int, required=True)
+    c.add_argument("--body", required=True)
+    c.set_defaults(func=cmd_comments_draft)
+
+    c = csub.add_parser("send-reply")
+    c.add_argument("--comment-id", type=int, required=True)
+    c.set_defaults(func=cmd_comments_send)
+
+    sp = sub.add_parser("audit-verify"); sp.set_defaults(func=cmd_audit_verify)
+    sp = sub.add_parser("doctor"); sp.set_defaults(func=cmd_doctor)
+
+    return p
+
+
+def main():
+    setup_logging()
+    init_db()
+    args = build_parser().parse_args()
+    try:
+        args.func(args)
+    except Exception as e:
+        log.exception("command failed: %s", e)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## `__init__.py` 파일
+
+모든 패키지 디렉터리에 빈 `__init__.py`를 생성합니다:
+
+```bash
+touch clients/__init__.py services/__init__.py utils/__init__.py webhook/__init__.py preview/__init__.py
+mkdir -p preview/templates
+```
+
+---
+
+## 실행 순서
+
+```bash
+# 1) 환경 구성
+cp .env.example .env
+# .env 편집 → 실제 자격 증명 입력
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# 2) 헬스체크
+python main.py doctor
+python main.py audit-verify
+
+# 3) 상품 동기화 (draft로 생성)
+python main.py sync-products --keyword "phone case" --pages 1
+
+# 4) 미리보기 서버 (브라우저에서 http://127.0.0.1:8000/orders/1)
+python main.py preview
+
+# 5) 웹훅 수신 (터널 필요 시 ngrok http 8001)
+python main.py webhook --port 8001
+
+# 6) 주문 수집 → 미리보기 → 샌드박스 → 실제 발주
+python main.py orders collect --channel all
+python main.py orders preview --order-id 1
+python main.py orders place --order-id 1 --sandbox-first
+python main.py orders push-tracking --order-id 1
+
+# 7) 리스팅 / 댓글
+python main.py listing hide --sku CJ-12345 --channels shopify
+python main.py comments sync
+python main.py comments draft-reply --comment-id 1 --body "Thank you!"
+python main.py comments send-reply --comment-id 1
+
+# 8) 재고 동기화 (cron 권장: 15~30분 간격)
+python main.py sync-inventory
+```
+
+---
+
+## 이 코드에서 의도적으로 비워 둔 부분
+
+- **CJ 웹훅 등록(`webhook/set`)**: 계정 등급·7개 토픽 상태 관리가 필요하므로 `CJClient`에 메서드만 추가하고 호출은 수동으로 두었습니다. 터널 주소가 확정된 뒤 `product`·`stock`·`order`·`logistics` 4개를 **항상 함께** 전송하도록 구현하세요.
+- **Shopify 리뷰 어댑터**: `comment_service.send_reply`가 `woocommerce`만 처리합니다. Judge.me 등 리뷰 앱의 API 키를 `.env`에 추가하고 `ShopifyReviewProvider`를 구현하면 됩니다.
+- **이미지 재업로드**: `utils/images.py`를 만들고 `create_product` 진입부에서 공급처 이미지를 로컬로 받아 채널 미디어 API로 업로드하는 로직을 추가하세요.
+- **`openId` 마스킹**: `logging_setup.py`의 정규식이 `open_id`/`openId` 키를 마스킹하지만, `webhook/receiver.py`에서 예외 스택을 그대로 로그에 남기지 않도록 `log.exception` 대신 커스텀 핸들러를 두는 편이 더 안전합니다.
+
+이 상태로 `python main.py doctor`가 통과하면, 상품 동기화부터 발주·리스팅·댓글까지 로컬에서 완결되는 운영 콘솔이 동작합니다.

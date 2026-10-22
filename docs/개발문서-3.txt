@@ -1,0 +1,563 @@
+요청하신 네 가지 기능—**미리보기, 주문 발주, 리스팅, 댓글 답글**—은 이전에 설계한 상품 동기화 시스템 위에 **운영 레이어**를 추가하는 작업입니다. 상품 등록이 "데이터를 채널에 심는 일"이라면, 이 네 가지는 **"심은 데이터를 실제로 굴리는 일"** 입니다. 핵심은 각 채널 API가 이 네 기능을 **어디까지 네이티브로 지원하는지** 정확히 구분하는 것입니다.
+
+---
+
+## 전체 확장 아키텍처
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    로컬 Python 프로그램                       │
+│                                                              │
+│  [기존] 상품 동기화                                            │
+│    CJ Fetcher → Normalizer → Woo/Shopify Uploader            │
+│                                                              │
+│  [신규] 운영 레이어                                            │
+│  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌─────────┐ │
+│  │ Preview    │  │ Order      │  │ Listing    │  │ Comment │ │
+│  │ Service    │  │ Service    │  │ Service    │  │ Service │ │
+│  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘  └────┬────┘ │
+│        │               │               │               │      │
+│        ▼               ▼               ▼               ▼      │
+│   로컬 웹 UI       CJ 주문 API      채널 게시 API     채널 리뷰 │
+│   (FastAPI)        채널 주문 API     상태 변경 API     답글 API │
+└──────────────────────────────────────────────────────────────┘
+```
+
+네 기능 모두 **로컬 SQLite DB를 중심으로 상태를 관리**해야 합니다. 외부 API는 언제든 실패할 수 있고, 같은 작업이 두 번 실행되면 중복 주문·중복 답글이 생기기 때문입니다.
+
+---
+
+## 1. DB 스키마 확장 — 운영 레이어의 상태 저장소
+
+기존 `canonical_products` / `supplier_products` / `channel_variants` / `mapping` 테이블에 네 개의 테이블을 추가합니다.
+
+```sql
+-- 주문 (채널에서 수집한 원본)
+CREATE TABLE IF NOT EXISTS orders (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel           TEXT NOT NULL,              -- 'woocommerce' | 'shopify'
+    channel_order_id  TEXT NOT NULL,              -- Woo: int, Shopify: gid
+    channel_order_num TEXT,
+    status            TEXT,                       -- 채널 상태 원문
+    financial_status  TEXT,
+    total             TEXT,                       -- Decimal 문자열
+    currency          TEXT,
+    customer_email    TEXT,
+    shipping_address  TEXT,                       -- JSON
+    raw_json          TEXT,
+    fetched_at        TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(channel, channel_order_id)
+);
+
+-- 주문 품목 → 공급처 SKU 매핑
+CREATE TABLE IF NOT EXISTS order_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id        INTEGER NOT NULL REFERENCES orders(id),
+    channel_line_id TEXT NOT NULL,
+    supplier_sku    TEXT,
+    quantity        INTEGER NOT NULL,
+    unit_price      TEXT,
+    mapped          INTEGER DEFAULT 0
+);
+
+-- CJ 발주 기록 (중복 발주 방지의 핵심)
+CREATE TABLE IF NOT EXISTS cj_orders (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    local_order_id    INTEGER NOT NULL REFERENCES orders(id),
+    cj_order_number   TEXT NOT NULL,              -- 우리가 생성한 고유 번호
+    cj_order_id       TEXT,                       -- CJ 응답 data
+    status            TEXT,                       -- CREATED / PAID / SHIPPED ...
+    tracking_number   TEXT,
+    logistic_name     TEXT,
+    is_sandbox        INTEGER DEFAULT 0,
+    created_at        TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(local_order_id),
+    UNIQUE(cj_order_number)
+);
+
+-- 리뷰 / 댓글
+CREATE TABLE IF NOT EXISTS comments (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel           TEXT NOT NULL,
+    channel_comment_id TEXT NOT NULL,
+    product_ref       TEXT,                       -- canonical_sku 또는 channel product id
+    author            TEXT,
+    body              TEXT,
+    rating            INTEGER,
+    status            TEXT,                       -- approved / unapproved / spam
+    parent_id         TEXT,                       -- 답글인 경우 부모 댓글 ID
+    created_at        TEXT,
+    raw_json          TEXT,
+    UNIQUE(channel, channel_comment_id)
+);
+
+-- 우리가 작성한 답글 기록 (중복 답글 방지)
+CREATE TABLE IF NOT EXISTS comment_replies (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    comment_id         INTEGER NOT NULL REFERENCES comments(id),
+    channel            TEXT NOT NULL,
+    channel_reply_id   TEXT,
+    body               TEXT,
+    created_at         TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(comment_id)
+);
+```
+
+`cj_orders.local_order_id`에 **UNIQUE 제약**을 거는 것이 가장 중요합니다. 주문 발주 잡이 두 번 돌아도 두 번째 INSERT가 실패하면서 중복 발주가 원천 차단됩니다.
+
+---
+
+## 2. 미리보기 — 로컬 FastAPI 웹 UI
+
+"미리보기"는 두 가지로 나뉩니다. **채널에 반영되기 전의 데이터를 사람이 눈으로 검수하는 것**과, **채널에 이미 반영된 결과를 로컬에서 확인하는 것**입니다. 로컬 FastAPI 서버를 띄워 둘 다 처리합니다.
+
+### 2-1. 미리보기 서버 구조
+
+```python
+# preview/app.py
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from db import DB_PATH
+import sqlite3, json
+
+app = FastAPI(title="Dropship Local Preview")
+
+@app.get("/orders/{order_id}", response_class=HTMLResponse)
+def preview_order(order_id: int):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        order = conn.execute(
+            "SELECT * FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        if not order:
+            raise HTTPException(404)
+        items = conn.execute(
+            "SELECT * FROM order_items WHERE order_id = ?", (order_id,)
+        ).fetchall()
+    return _render_order(order, items)
+
+@app.get("/products/{canonical_sku}", response_class=HTMLResponse)
+def preview_product(canonical_sku: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        prod = conn.execute(
+            "SELECT * FROM canonical_products WHERE canonical_sku = ?",
+            (canonical_sku,),
+        ).fetchone()
+        variants = conn.execute(
+            "SELECT * FROM channel_variants WHERE canonical_sku = ?",
+            (canonical_sku,),
+        ).fetchall()
+    return _render_product(prod, variants)
+```
+
+`_render_order`는 주문의 **채널 상태, 품목별 공급처 SKU 매핑 여부, CJ 발주 상태**를 한 화면에 보여줍니다. 매핑되지 않은 품목(`mapped=0`)은 빨간색으로 표시해 발주 전에 반드시 확인하도록 유도합니다.
+
+### 2-2. 채널 상품 페이지 미리보기
+
+채널에 이미 게시된 상품은 각 채널의 **미리보기 URL**을 그대로 열 수 있습니다. Shopify는 `https://{shop}/products/{handle}`, WooCommerce는 `https://{store}/?p={id}` 또는 `?post_type=product&p={id}`입니다. 로컬 서버에서 `webbrowser.open()`으로 띄우거나, iframe으로 임베드하면 됩니다. Shopify는 기본적으로 iframe 임베드를 막는 `X-Frame-Options`를 보내므로, **iframe보다 새 창 열기가 안전**합니다.
+
+### 2-3. CJ 발주 전 샌드박스 미리보기
+
+CJ 주문 생성 API는 `isSandbox: 1`을 지원합니다. 이 모드에서는 **실제 결제·물류·이행이 발생하지 않고 가짜 시뮬레이션만 수행**됩니다. 따라서 실제 발주 전에 **샌드박스로 한 번 생성 → 응답 구조 확인 → 삭제 또는 무시**하는 워크플로를 미리보기 단계에 넣을 수 있습니다.
+
+```python
+# preview/sandbox.py
+def preview_cj_order(cj_client, payload: dict) -> dict:
+    """실제 발주 전 샌드박스로 검증만 수행"""
+    sandbox_payload = {**payload, "isSandbox": 1}
+    resp = cj_client.session.post(
+        f"{CJ_BASE}/shopping/order/createOrder",
+        headers={"CJ-Access-Token": cj_client.token},
+        json=sandbox_payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+```
+
+샌드박스 주문은 실제 주문 번호 체계에 영향을 주지 않으므로, **발주 잡을 실행하기 전 매번 호출해도 무방**합니다. 단, API 호출 횟수는 소모되므로 캐시된 페이로드로 하루 1회 정도만 검증하는 것이 효율적입니다.
+
+---
+
+## 3. 주문 발주 — 채널 주문 → CJ 주문
+
+### 3-1. 주문 수집
+
+WooCommerce와 Shopify 모두 주문 목록 조회를 지원합니다. WooCommerce Orders API는 `status` 필터로 `processing` 등 특정 상태만 가져올 수 있고, Shopify GraphQL은 `orders(query: "fulfillment_status:unfulfilled")` 같은 검색 쿼리를 사용합니다.
+
+```python
+# orders/collector.py
+def collect_woo_orders(wcapi, status="processing", page=1):
+    resp = wcapi.get("orders", params={"status": status, "per_page": 100, "page": page})
+    resp.raise_for_status()
+    return resp.json()
+
+def collect_shopify_orders(client, cursor=None):
+    query = """
+    query Orders($cursor: String) {
+      orders(first: 50, after: $cursor,
+             query: "fulfillment_status:unfulfilled AND status:open") {
+        edges {
+          node {
+            id name displayFinancialStatus
+            totalPriceSet { shopMoney { amount currencyCode } }
+            email
+            shippingAddress { address1 city province country zip phone name }
+            lineItems(first: 50) {
+              edges { node { id quantity sku name originalUnitPriceSet { shopMoney { amount } } } }
+            }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+    """
+    data = client.execute(query, {"cursor": cursor})
+    return data["orders"]
+```
+
+수집한 주문은 `orders` / `order_items`에 저장하고, `supplier_sku`는 `channel_variants`의 `channel_sku` 또는 `mapping` 테이블을 조회해 채웁니다. **매핑되지 않은 품목이 하나라도 있으면 발주를 보류**하고 미리보기 화면에 표시합니다.
+
+### 3-2. CJ 주문 생성
+
+CJ `createOrder`는 `orderNumber`(고유 파트너 주문 번호), 배송지 정보, `products` 배열(`vid`, `quantity`, `shippingName`)을 요구합니다.
+
+```python
+# orders/cj_order.py
+import uuid
+from decimal import Decimal
+
+def build_cj_payload(order, items, vid_map: dict[str, str]) -> dict:
+    products = []
+    for it in items:
+        vid = vid_map.get(it["supplier_sku"])
+        if not vid:
+            raise ValueError(f"CJ vid missing for SKU {it['supplier_sku']}")
+        products.append({
+            "vid": vid,
+            "quantity": str(it["quantity"]),
+            "shippingName": it["supplier_sku"],
+        })
+
+    addr = order["shipping_address"]  # 파싱된 dict
+    return {
+        "orderNumber": f"LOCAL-{order['id']}-{uuid.uuid4().hex[:8]}",
+        "shippingCountryCode": addr["country_code"],
+        "shippingCountry": addr["country"],
+        "shippingProvince": addr.get("province", ""),
+        "shippingCity": addr.get("city", ""),
+        "shippingAddress": addr.get("address1", ""),
+        "shippingAddress2": addr.get("address2", ""),
+        "shippingCustomerName": addr.get("name", ""),
+        "shippingZip": addr.get("zip", ""),
+        "shippingPhone": addr.get("phone", ""),
+        "houseNumber": addr.get("house_number", ""),
+        "logisticName": order.get("preferred_logistic", "PostNL"),
+        "fromCountryCode": "CN",
+        "remark": f"Channel: {order['channel']} / {order['channel_order_num']}",
+        "isSandbox": 0,
+        "products": products,
+    }
+
+def create_cj_order(cj_client, payload: dict) -> dict:
+    resp = cj_client.session.post(
+        f"{CJ_BASE}/shopping/order/createOrder",
+        headers={"CJ-Access-Token": cj_client.token},
+        json=payload,
+        timeout=60,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    if not body.get("result"):
+        raise RuntimeError(f"CJ order failed: {body}")
+    return body
+```
+
+### 3-3. 중복 발주 방지 트랜잭션
+
+발주는 **"CJ 호출 → 성공 시에만 DB 기록"** 순서로 하면 CJ 호출은 성공했는데 DB 기록 전에 프로세스가 죽었을 때 중복 발주가 발생합니다. 반대로 **"DB에 pending 기록 → CJ 호출 → 결과로 상태 업데이트"** 순서로 하면, pending 상태로 남은 주문을 재시도할 때 CJ에 이미 생성되었는지 확인할 수 있습니다.
+
+```python
+def place_order(order_id: int):
+    with sqlite3.connect(DB_PATH) as conn:
+        # 1) pending 선기록 (UNIQUE 제약이 중복 진입 차단)
+        conn.execute(
+            """INSERT OR IGNORE INTO cj_orders
+               (local_order_id, cj_order_number, status)
+               VALUES (?, ?, 'PENDING')""",
+            (order_id, f"PENDING-{order_id}"),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM cj_orders WHERE local_order_id = ?", (order_id,)
+        ).fetchone()
+        if row["status"] != "PENDING":
+            return  # 이미 처리됨
+
+    # 2) CJ 호출
+    payload = build_cj_payload(...)
+    result = create_cj_order(cj_client, payload)
+
+    # 3) 성공 기록
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """UPDATE cj_orders SET cj_order_id = ?, status = 'CREATED',
+               cj_order_number = ? WHERE local_order_id = ?""",
+            (result["data"], payload["orderNumber"], order_id),
+        )
+        conn.commit()
+```
+
+CJ `createOrder` 응답의 `data`가 CJ 주문 ID입니다. 이 ID를 저장해 두어야 이후 `order/query`로 상태·송장번호를 조회할 수 있습니다.
+
+### 3-4. 채널 측 주문 상태 반영 (발주 완료 후)
+
+CJ에서 발주가 생성되면 채널 주문에 **메모(고객 비공개)** 를 남기고, 송장이 나오면 채널 주문을 **fulfilled/processing**으로 변경합니다.
+
+WooCommerce는 `PUT /orders/{id}`로 상태를 바꾸고, `POST /orders/{id}/notes`로 메모를 추가합니다. `customer_note: false`이면 관리자 전용 메모가 됩니다.
+
+```python
+wcapi.put(f"orders/{woo_order_id}", {"status": "processing"})
+wcapi.post(f"orders/{woo_order_id}/notes", {
+    "note": f"CJ order {cj_order_id} created",
+    "customer_note": False,
+})
+```
+
+Shopify는 **2단계**입니다. 주문 생성 시 fulfillment order가 자동 생성되므로, 먼저 `order.fulfillmentOrders`를 조회해 **fulfillment order ID와 line item ID**를 얻고, 그 다음 `fulfillmentCreate`로 송장 정보와 함께 이행을 생성합니다.
+
+```python
+FULFILLMENT_ORDERS = """
+query($orderId: ID!) {
+  order(id: $orderId) {
+    fulfillmentOrders(first: 10) {
+      edges { node { id status lineItems(first: 50) {
+        edges { node { id remainingQuantity lineItem { id } } }
+      } } }
+    }
+  }
+}
+"""
+```
+
+```python
+FULFILLMENT_CREATE = """
+mutation($fulfillment: FulfillmentInput!) {
+  fulfillmentCreate(fulfillment: $fulfillment) {
+    fulfillment { id status trackingInfo { number url } }
+    userErrors { field message }
+  }
+}
+"""
+```
+
+`FulfillmentInput`에는 `lineItemsByFulfillmentOrder` 배열로 `fulfillmentOrderId`와 `fulfillmentOrderLineItems`를 지정하고, `trackingInfo`에 CJ 송장번호와 URL을 넣습니다.
+
+---
+
+## 4. 리스팅 — 채널 게시/비게시 및 상태 관리
+
+리스팅은 "상품을 판매 채널에 노출할지"를 제어하는 작업입니다. **Shopify는 `publishablePublish` / `publishableUnpublish`, WooCommerce는 `status`와 `catalog_visibility`** 로 접근 방식이 다릅니다.
+
+### 4-1. Shopify — Publication 기반 게시
+
+Shopify는 상품을 **Publication(판매 채널)** 에 게시해야 구매자에게 보입니다. Online Store, Point of Sale, 커스텀 채널이 각각 Publication을 가집니다. 먼저 `publications` 쿼리로 Publication ID를 확보합니다.
+
+```python
+PUBLICATIONS_QUERY = """
+query { publications(first: 20) {
+  nodes { id catalog { title } }
+} }
+"""
+```
+
+```python
+PUBLISH_MUTATION = """
+mutation($id: ID!, $input: [PublicationInput!]!) {
+  publishablePublish(id: $id, input: $input) {
+    publishable { availablePublicationsCount { count } }
+    userErrors { field message }
+  }
+}
+"""
+
+def publish_shopify_product(client, product_gid: str, publication_ids: list[str]):
+    inputs = [{"publicationId": pid} for pid in publication_ids]
+    return client.execute(PUBLISH_MUTATION, {"id": product_gid, "input": inputs})
+```
+
+비게시는 `publishableUnpublish`에 동일한 `PublicationInput` 배열을 넘기면 됩니다. 이 방식은 상품을 삭제하지 않고 **특정 채널에서만 숨길 수 있어** 리스팅 관리에 적합합니다.
+
+### 4-2. WooCommerce — status + catalog_visibility
+
+WooCommerce 상품에는 두 개의 노출 제어 필드가 있습니다. `status`(`draft`/`publish`/`private`)는 상품 자체의 게시 상태이고, `catalog_visibility`(`visible`/`catalog`/`search`/`hidden`)는 카탈로그·검색에서의 노출 여부입니다. 리스팅 관리에서는 **`status`는 `publish`로 유지하고 `catalog_visibility`만 토글**하는 방식이 재고·가격 동기화에 영향을 주지 않아 안전합니다.
+
+```python
+def set_woo_listing(wcapi, product_id: int, visible: bool):
+    wcapi.put(f"products/{product_id}", {
+        "catalog_visibility": "visible" if visible else "hidden",
+    })
+```
+
+재고 상태(`stock_status`: `instock`/`outofstock`/`onbackorder`)는 리스팅과 별개입니다. 품절이어도 리스팅은 유지하되 `stock_status`만 `outofstock`으로 바꾸는 것이 일반적입니다.
+
+### 4-3. 리스팅 대시보드
+
+로컬 DB의 `channel_variants`와 `canonical_products`를 조인해 **채널별 게시 상태를 한눈에 보는 CLI**를 제공합니다.
+
+```python
+def listing_report():
+    rows = query("""
+        SELECT cp.canonical_sku, cp.title,
+               cv.channel, cv.channel_product_id, cv.channel_variant_id
+        FROM canonical_products cp
+        JOIN channel_variants cv ON cv.canonical_sku = cp.canonical_sku
+        ORDER BY cp.canonical_sku, cv.channel
+    """)
+    for r in rows:
+        print(f"{r['canonical_sku']} | {r['channel']:12} | {r['channel_product_id']}")
+```
+
+---
+
+## 5. 댓글 답글 — 채널별 지원 범위가 완전히 다르다
+
+여기가 네 기능 중 **가장 주의가 필요한 부분**입니다. WooCommerce와 Shopify의 리뷰/댓글 모델이 근본적으로 다릅니다.
+
+### 5-1. WooCommerce — 리뷰 API + WordPress 댓글 API 조합
+
+WooCommerce의 **Product Reviews API**는 리뷰의 CRUD(생성·조회·수정·삭제)를 지원하지만, **답글 생성 전용 엔드포인트는 없습니다**. WooCommerce 리뷰는 내부적으로 WordPress의 **comment**로 저장되므로, 답글은 **WP REST API의 comments 엔드포인트**를 사용해 `parent` 필드에 원본 리뷰 ID를 지정하는 방식으로 작성합니다.
+
+```python
+# comments/woo_comments.py
+import requests
+
+WP_BASE = f"{WC_URL}/wp-json/wp/v2"
+WP_AUTH = (WP_USER, WP_APP_PASSWORD)   # WooCommerce 키가 아닌 Application Password
+
+def list_product_reviews(product_id: int):
+    resp = requests.get(
+        f"{WC_URL}/wp-json/wc/v3/products/reviews",
+        params={"product": product_id, "per_page": 100},
+        auth=(WC_CK, WC_CS),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+def reply_to_review(review_id: int, body: str):
+    """review_id = WooCommerce review id = WordPress comment ID"""
+    resp = requests.post(
+        f"{WP_BASE}/comments",
+        auth=WP_AUTH,
+        json={
+            "content": body,
+            "parent": review_id,
+            "status": "approve",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+```
+
+**인증이 이중이라는 점이 함정입니다.** WooCommerce 리뷰 조회는 `ck_`/`cs_` 키를 쓰지만, WordPress 댓글 작성은 **WordPress Application Password** 또는 Basic Auth가 필요합니다. `WP_USER`는 관리자 계정이어야 하며, Application Password는 WordPress 5.6+에서 사용자 프로필 → Application Passwords에서 발급합니다.
+
+답글 작성 후 `comment_replies` 테이블에 기록해 두면, 같은 리뷰에 중복 답글을 방지할 수 있습니다.
+
+### 5-2. Shopify — 네이티브 상품 리뷰 API가 없다
+
+Shopify에는 **상품 리뷰를 다루는 1급 API가 존재하지 않습니다**. Shopify Community와 개발자 문서에 따르면, 상품 리뷰는 Products/Variants처럼 독립 리소스가 아니며 **`spr` 네임스페이스의 metafield에 저장**되거나 서드파티 리뷰 앱(Judge.me, Loox, Yotpo 등)이 자체 데이터베이스에 보관합니다.
+
+Shopify가 제공하는 `comments` 리소스는 **블로그 글의 댓글**용이며, 상품 리뷰와는 무관합니다. 따라서 Shopify 상품 리뷰 답글은 다음 세 가지 경로 중 하나를 선택해야 합니다.
+
+**경로 A — 리뷰 앱의 API 사용 (가장 현실적).** Judge.me, Loox 등 주요 앱은 자체 REST API를 제공합니다. 예를 들어 Judge.me는 공개 답글과 비공개 답글 API를 제공합니다. 로컬 프로그램은 앱별 어댑터를 두고, `ShopifyCommentProvider` 인터페이스를 구현합니다.
+
+```python
+# comments/shopify_review_provider.py
+class ShopifyReviewProvider:
+    """Shopify 네이티브 리뷰 API가 없으므로 앱별 어댑터를 둔다."""
+    def __init__(self, app: str, api_key: str):
+        self.app = app          # 'judgeme' | 'loox' | ...
+        self.api_key = api_key
+
+    def list_reviews(self, product_gid: str): ...
+    def reply(self, review_id: str, body: str, public: bool = True): ...
+```
+
+**경로 B — `spr` metafield 직접 업데이트.** 리뷰가 `spr` metafield에 저장된 테마(예: Shopify 기본 리뷰 앱)라면, `metafieldsSet`으로 해당 metafield 값을 갱신할 수 있습니다. 다만 metafield 내부 JSON 구조를 정확히 알아야 하고, 앱이 주기적으로 덮어쓸 수 있어 **신뢰성이 낮습니다**.
+
+**경로 C — 블로그 댓글만 Shopify Comments API로 처리.** 상품 리뷰가 아니라 블로그 글 댓글이라면 `POST /admin/api/{version}/comments.json`으로 답글을 작성할 수 있습니다. 이 경우에만 Shopify 네이티브 API가 유효합니다.
+
+> **실무 권장:** Shopify 상품 리뷰 답글은 **리뷰 앱의 API를 어댑터로 추상화**하고, 앱이 없는 경우에는 기능을 비활성화하는 것이 정직한 설계입니다. Shopify 네이티브 API만으로 상품 리뷰 답글을 구현하려는 시도는 대부분 실패합니다.
+
+### 5-3. 댓글 수집·답글 파이프라인
+
+```python
+# comments/service.py
+def sync_comments():
+    # WooCommerce: 리뷰 API로 수집 (status=pending/approved)
+    for review in list_product_reviews_all():
+        upsert_comment("woocommerce", review)
+
+    # Shopify: 앱 어댑터가 설정된 경우에만 수집
+    if shopify_review_provider:
+        for review in shopify_review_provider.list_reviews():
+            upsert_comment("shopify", review)
+
+def auto_reply(comment_row, reply_body: str):
+    if comment_row["channel"] == "woocommerce":
+        resp = reply_to_review(comment_row["channel_comment_id"], reply_body)
+    elif comment_row["channel"] == "shopify":
+        resp = shopify_review_provider.reply(
+            comment_row["channel_comment_id"], reply_body
+        )
+    record_reply(comment_row["id"], resp["id"], reply_body)
+```
+
+자동 답글은 **반드시 수동 승인 후 발송**하도록 설계하세요. 리뷰 내용을 오해한 자동 답글은 브랜드 신뢰도에 직접 타격을 줍니다. `comment_replies`에 `status='draft'`로 먼저 저장하고, 로컬 미리보기 UI에서 승인하면 실제 API를 호출하는 2단계 구조가 안전합니다.
+
+---
+
+## 6. 통합 CLI
+
+네 기능을 각각 독립 명령으로 분리합니다. `argparse` 또는 `typer`로 구성합니다.
+
+```bash
+# 미리보기 서버
+python main.py preview --port 8000
+
+# 주문 수집 + 미리보기
+python main.py orders collect --channel all
+python main.py orders preview --order-id 42
+
+# 발주 (샌드박스 검증 후 실제 발주)
+python main.py orders place --order-id 42 --sandbox-first
+python main.py orders push-tracking --order-id 42
+
+# 리스팅
+python main.py listing publish --sku CJ-12345 --channels shopify,woocommerce
+python main.py listing hide   --sku CJ-12345 --channels shopify
+
+# 댓글
+python main.py comments sync --channel all
+python main.py comments draft-reply --comment-id 7 --body "Thank you!"
+python main.py comments send-reply  --comment-id 7
+```
+
+`--sandbox-first` 플래그는 발주 전 CJ 샌드박스 호출을 강제합니다. 실제 발주는 **샌드박스 응답이 정상일 때만** 진행되도록 게이트를 두면, 페이로드 오류로 인한 실패를 크게 줄일 수 있습니다.
+
+---
+
+## 7. 운영 시 반드시 지켜야 할 규칙
+
+**주문 발주는 절대 자동 루프로 돌리지 마세요.** 재고 동기화는 자동화해도 되지만, 발주는 금전·물류가 걸린 작업입니다. 수집 → 매핑 검증 → 샌드박스 → **사람 승인** → 실제 발주 순서를 고정하세요.
+
+**Shopify fulfillment는 비동기적으로 처리됩니다.** `fulfillmentCreate`가 성공해도 실제 이행 완료까지 시간이 걸릴 수 있으므로, `fulfillment.status`를 주기적으로 폴링하거나 `fulfillments/update` 웹훅을 수신해야 합니다.
+
+**WooCommerce 댓글 답글의 인증 분리**를 잊지 마세요. WooCommerce API 키와 WordPress Application Password는 서로 다른 자격 증명입니다. `.env`에 `WP_USER` / `WP_APP_PASSWORD`를 별도로 두세요.
+
+**Shopify 상품 리뷰는 네이티브로 불가능하다는 전제**를 문서화하세요. 리뷰 앱을 사용하지 않는 Shopify 스토어라면 댓글 답글 기능은 **WooCommerce 전용**으로 범위를 한정하는 것이 현실적입니다.
+
+이 네 가지 기능을 추가하면 로컬 프로그램은 단순한 "상품 업로더"에서 **드랍쉽핑 운영 콘솔**로 확장됩니다. 핵심은 각 기능을 독립 서비스로 분리하고, 모든 상태를 SQLite에 기록해 **외부 API 장애나 중복 실행에도 안전하게** 만드는 것입니다.

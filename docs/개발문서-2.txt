@@ -1,0 +1,662 @@
+이전 답변의 뼈대를 유지하되, **각 API의 실제 제약 조건(속도 제한·과금 모델)** , **SKU 매핑을 위한 로컬 DB 스키마**, **재고 동기화 전략**, **에러 처리·재시도 로직**을 코드 수준으로 구체화하겠습니다.
+
+---
+
+## 0. 먼저 알아야 할 2025~2026년 API 환경 변화
+
+설계 전에 반드시 반영해야 할 세 가지 변화가 있습니다.
+
+**CJ Dropshipping — "호출 횟수"에서 "포인트 소비"로 전환 중.** CJ API는 `/product/list` 호출당 **50포인트**, `/product/query`와 `/product/variant/query`는 각각 **10포인트**를 소모합니다. 기존 "하루 N회" 제한에서 포인트 기반으로 바뀌고 있으므로, 상품 상세를 무분별하게 반복 호출하면 비용이 빠르게 누적됩니다. 반드시 **로컬 캐시**를 두고 변경분만 재조회해야 합니다.
+
+**Shopify — REST Admin API는 사실상 레거시.** REST Admin API는 2024년 10월 1일부로 레거시로 전환되었고, **2025년 4월 1일 이후 Shopify App Store에 제출되는 모든 신규 앱은 GraphQL만 사용해야 합니다**​. 커스텀 앱도 신규 GraphQL 상품 API로의 마이그레이션이 요구되므로, 이 글에서는 **GraphQL을 기본 구현으로** 다룹니다.
+
+**속도 제한은 "요청 수"가 아니라 "비용" 기준.** Shopify GraphQL은 쿼리 복잡도에 따라 포인트를 차감하는 **leaky bucket** 방식입니다. Standard 플랜은 초당 100포인트 회복, Plus는 1,000포인트입니다. 단일 쿼리는 플랜과 무관하게 최대 1,000포인트를 초과할 수 없습니다.
+
+---
+
+## 1. 프로젝트 구조
+
+```
+dropship-sync/
+├── .env
+├── config.py
+├── db.py                      # SQLite 스키마 + 매핑 테이블
+├── models.py                  # 정규화 데이터클래스
+├── clients/
+│   ├── cj_client.py           # CJ API (인증, 속도 제한, 캐시)
+│   ├── woo_client.py          # WooCommerce REST
+│   └── shopify_client.py      # Shopify GraphQL
+├── services/
+│   ├── normalizer.py          # 공급처 → 공통 스키마
+│   ├── product_sync.py        # 상품 생성/업데이트 오케스트레이션
+│   └── inventory_sync.py      # 재고·가격 주기 동기화
+├── utils/
+│   ├── throttle.py            # 토큰 버킷 / 지수 백오프
+│   └── images.py              # 이미지 다운로드·재업로드
+└── main.py                    # CLI 진입점 (sync-products, sync-inventory)
+```
+
+**의존성:**
+
+```bash
+pip install requests python-dotenv tenacity woocommerce
+```
+
+---
+
+## 2. 로컬 DB 스키마 — SKU 매핑이 시스템의 심장
+
+드랍쉽핑 다채널 판매에서 가장 흔한 버그는 **동일 상품이 중복 생성되거나, 재고 업데이트가 엉뚱한 변형에 적용되는 것**입니다. 원인은 대부분 "공급처 SKU ↔ 채널 변형 ID" 매핑을 메모리에만 두거나, SKU 문자열에 의존하기 때문입니다.
+
+신뢰할 수 있는 매핑 시스템은 **① 정규 상품(canonical), ② 공급처 상품, ③ 매핑 관계**의 3계층으로 구성됩니다.
+
+```python
+# db.py
+import sqlite3
+from pathlib import Path
+
+DB_PATH = Path("dropship.db")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS canonical_products (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_sku TEXT UNIQUE NOT NULL,
+    title         TEXT NOT NULL,
+    created_at    TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS supplier_products (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    supplier      TEXT NOT NULL,              -- 'cj'
+    supplier_pid  TEXT NOT NULL,              -- CJ product id
+    supplier_sku  TEXT NOT NULL,              -- CJ variantSku
+    raw_json      TEXT,                       -- 마지막 응답 원본 (디버깅·캐시)
+    last_synced   TEXT,
+    UNIQUE(supplier, supplier_sku)
+);
+
+CREATE TABLE IF NOT EXISTS channel_variants (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_sku     TEXT NOT NULL,
+    channel           TEXT NOT NULL,          -- 'woocommerce' | 'shopify'
+    channel_product_id TEXT NOT NULL,
+    channel_variant_id TEXT NOT NULL,         -- Woo: variation id, Shopify: gid
+    channel_sku       TEXT,
+    UNIQUE(channel, channel_variant_id)
+);
+
+CREATE TABLE IF NOT EXISTS mapping (
+    canonical_sku TEXT NOT NULL,
+    supplier      TEXT NOT NULL,
+    supplier_sku  TEXT NOT NULL,
+    priority      INTEGER DEFAULT 1,          -- 낮을수록 우선 공급처
+    verified      INTEGER DEFAULT 0,
+    PRIMARY KEY (canonical_sku, supplier, supplier_sku)
+);
+
+CREATE INDEX IF NOT EXISTS idx_channel_variant
+    ON channel_variants(channel, channel_variant_id);
+CREATE INDEX IF NOT EXISTS idx_supplier_sku
+    ON supplier_products(supplier, supplier_sku);
+"""
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executescript(SCHEMA)
+```
+
+**핵심 설계 포인트:**
+
+- `channel_variants` 테이블이 **각 채널의 변형 ID를 영구 보관**합니다. 재고 동기화 시 SKU로 검색하지 않고 이 테이블에서 ID를 꺼내 직접 업데이트하므로, SKU가 바뀌거나 중복되어도 라우팅이 깨지지 않습니다.
+- `canonical_sku`는 내부 식별자입니다. 바코드(UPC/EAN)가 있으면 최우선으로 사용하고, 없으면 `{supplier}-{supplier_sku}` 형태로 결정적(deterministic) 생성합니다.
+- Shopify는 **두 변형이 같은 SKU를 가질 수 있기 때문에**, SKU에 의존한 업데이트는 반드시 사고로 이어집니다. `channel_variant_id`가 유일한 안전한 키입니다.
+
+---
+
+## 3. CJ API 클라이언트 — 인증과 속도 제한
+
+### 3-1. 인증
+
+CJ API V2는 `CJ-Access-Token` 헤더를 요구합니다. 토큰 발급 엔드포인트는 **5분에 1회**, 갱신은 **분당 5회**로 강하게 제한됩니다. 따라서 토큰은 디스크에 캐시하고 만료 전에만 갱신해야 합니다.
+
+```python
+# clients/cj_client.py
+import json, time
+from pathlib import Path
+import requests
+from config import CJ_EMAIL, CJ_API_KEY, CJ_BASE
+
+TOKEN_CACHE = Path(".cj_token.json")
+
+class CJClient:
+    def __init__(self):
+        self.session = requests.Session()
+        self._token = self._load_token()
+
+    def _load_token(self) -> str | None:
+        if TOKEN_CACHE.exists():
+            data = json.loads(TOKEN_CACHE.read_text())
+            if data.get("expiry", 0) > time.time() + 60:
+                return data["token"]
+        return None
+
+    def _authenticate(self) -> str:
+        resp = self.session.post(
+            f"{CJ_BASE}/authentication/getAccessToken",
+            json={"email": CJ_EMAIL, "password": CJ_API_KEY},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if not body.get("result"):
+            raise RuntimeError(f"CJ auth failed: {body}")
+        token = body["data"]["accessToken"]
+        expiry = time.time() + body["data"].get("expiresIn", 3600) - 120
+        TOKEN_CACHE.write_text(json.dumps({"token": token, "expiry": expiry}))
+        return token
+
+    @property
+    def token(self) -> str:
+        if self._token is None:
+            self._token = self._authenticate()
+        return self._token
+
+    def get(self, path: str, params: dict | None = None) -> dict:
+        resp = self.session.get(
+            f"{CJ_BASE}{path}",
+            headers={"CJ-Access-Token": self.token},
+            params=params or {},
+            timeout=30,
+        )
+        if resp.status_code == 401:
+            TOKEN_CACHE.unlink(missing_ok=True)
+            self._token = self._authenticate()
+            return self.get(path, params)
+        resp.raise_for_status()
+        body = resp.json()
+        if not body.get("result"):
+            raise RuntimeError(f"CJ API error {path}: {body}")
+        return body["data"]
+```
+
+### 3-2. 사용자 등급별 QPS 제한
+
+CJ는 **IP당 초당 10요청**, 비로그인 인터페이스 초당 30요청을 공통 제한으로 두고, 인증 인터페이스는 **사용자 등급에 따라 1~6 QPS**로 제한합니다.
+
+| 등급 | QPS |
+|---|---|
+| Free / 판매등급 0·1 | 1 req/s |
+| Plus / 판매등급 2 | 2 req/s |
+| Prime / 판매등급 3 | 4 req/s |
+| Advanced / 판매등급 4·5 | 6 req/s |
+
+```python
+# utils/throttle.py
+import time, threading
+
+class TokenBucket:
+    def __init__(self, rate: float, capacity: float | None = None):
+        self.rate = rate
+        self.capacity = capacity or rate
+        self.tokens = self.capacity
+        self.last = time.monotonic()
+        self.lock = threading.Lock()
+
+    def acquire(self, amount: float = 1.0):
+        with self.lock:
+            while True:
+                now = time.monotonic()
+                self.tokens = min(
+                    self.capacity,
+                    self.tokens + (now - self.last) * self.rate,
+                )
+                self.last = now
+                if self.tokens >= amount:
+                    self.tokens -= amount
+                    return
+                time.sleep((amount - self.tokens) / self.rate)
+```
+
+`CJClient.get()` 진입부에서 `self.bucket.acquire()`를 호출하면 등급에 맞는 QPS가 강제됩니다. 여기에 `tenacity`로 **429/500 응답에 대한 지수 백오프**를 추가합니다.
+
+```python
+from tenacity import retry, wait_exponential, retry_if_exception_type, stop_after_attempt
+
+class TransientAPIError(Exception): ...
+
+@retry(
+    retry=retry_if_exception_type(TransientAPIError),
+    wait=wait_exponential(multiplier=1, min=2, max=60),
+    stop=stop_after_attempt(5),
+    reraise=True,
+)
+def get_with_retry(self, path, params=None):
+    self.bucket.acquire()
+    try:
+        return self.get(path, params)
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code in (429, 500, 502, 503):
+            raise TransientAPIError(str(e))
+        raise
+```
+
+---
+
+## 4. 데이터 정규화 — 공급처 응답을 공통 스키마로
+
+CJ `listV2`는 상품 후보 목록을, `variant/query`는 PID 기준 변형 상세를 반환합니다. 정규화 계층은 이 두 응답을 하나의 `NormalizedProduct`로 합칩니다.
+
+```python
+# models.py
+from dataclasses import dataclass, field
+from decimal import Decimal
+
+@dataclass
+class Variant:
+    supplier_sku: str
+    price: Decimal
+    stock: int
+    options: dict[str, str]
+    image: str | None = None
+
+@dataclass
+class NormalizedProduct:
+    supplier: str
+    supplier_pid: str
+    title: str
+    description_html: str
+    images: list[str]
+    variants: list[Variant]
+    category: str | None = None
+    tags: list[str] = field(default_factory=list)
+
+    @property
+    def canonical_sku(self) -> str:
+        return f"{self.supplier.upper()}-{self.supplier_pid}"
+```
+
+가격은 반드시 `Decimal`로 다룹니다. `float`는 `19.99` 같은 값에서 반올림 오차를 만들어 채널에 잘못된 가격이 등록될 수 있습니다.
+
+---
+
+## 5. WooCommerce 업로더 — 배치와 변형 처리
+
+### 5-1. 제약 조건
+
+WooCommerce는 자체 속도 제한을 강제하지 않지만, **호스팅과 WordPress 설정에 따라 실제 허용량이 달라집니다**. 배치 엔드포인트(`/products/batch`, `/products/{id}/variations/batch`)는 **요청당 최대 100개**를 처리하며, `woocommerce_rest_batch_items_limit` 필터로 이 한도를 조정할 수 있습니다.
+
+### 5-2. 상품 생성
+
+```python
+# clients/woo_client.py
+import os
+from woocommerce import API
+from models import NormalizedProduct
+
+wcapi = API(
+    url=os.environ["WC_URL"],
+    consumer_key=os.environ["WC_CK"],
+    consumer_secret=os.environ["WC_CS"],
+    version="wc/v3",
+    timeout=60,
+)
+
+def create_woo_product(p: NormalizedProduct) -> dict:
+    attributes = _extract_attributes(p.variants)
+    payload = {
+        "name": p.title,
+        "type": "variable" if len(p.variants) > 1 else "simple",
+        "status": "draft",                     # 검수 후 publish
+        "description": p.description_html,
+        "images": [{"src": url} for url in p.images],
+        "attributes": attributes,
+    }
+
+    if len(p.variants) == 1:
+        v = p.variants[0]
+        payload.update({
+            "regular_price": str(v.price),
+            "sku": v.supplier_sku,
+            "manage_stock": True,
+            "stock_quantity": v.stock,
+        })
+
+    resp = wcapi.post("products", payload)
+    resp.raise_for_status()
+    product = resp.json()
+
+    if len(p.variants) > 1:
+        _create_variations(product["id"], p.variants, attributes)
+    return product
+
+
+def _extract_attributes(variants):
+    options: dict[str, set] = {}
+    for v in variants:
+        for k, val in v.options.items():
+            options.setdefault(k, set()).add(val)
+    return [
+        {"name": k, "visible": True, "variation": True, "options": sorted(vals)}
+        for k, vals in options.items()
+    ]
+
+
+def _create_variations(product_id: int, variants, attributes):
+    """변형은 배치로 생성 (100개 단위 분할)"""
+    attr_names = [a["name"] for a in attributes]
+    items = []
+    for v in variants:
+        items.append({
+            "regular_price": str(v.price),
+            "sku": v.supplier_sku,
+            "manage_stock": True,
+            "stock_quantity": v.stock,
+            "attributes": [
+                {"name": name, "option": v.options[name]}
+                for name in attr_names
+                if name in v.options
+            ],
+        })
+    for chunk in _chunks(items, 100):
+        resp = wcapi.post(f"products/{product_id}/variations/batch", {"create": chunk})
+        resp.raise_for_status()
+        for created in resp.json().get("create", []):
+            _record_channel_variant(
+                canonical_sku=None,  # 호출부에서 주입
+                channel="woocommerce",
+                product_id=product_id,
+                variant_id=created["id"],
+                sku=created.get("sku"),
+            )
+```
+
+> **중요:** 변형 배치 응답의 `create` 배열에는 생성된 변형의 `id`가 포함됩니다. 이 ID를 `channel_variants` 테이블에 **즉시 저장**해야 이후 재고 동기화에서 API 조회 없이 직접 업데이트할 수 있습니다.
+
+### 5-3. 재고·가격 배치 업데이트
+
+재고 동기화는 상품 생성과 분리된 잡입니다. 변형 ID를 매핑 테이블에서 읽어 배치로 보냅니다.
+
+```python
+def batch_update_woo_variations(product_id: int, updates: list[dict]):
+    """
+    updates = [{"id": 123, "stock_quantity": 10, "regular_price": "19.99"}, ...]
+    """
+    for chunk in _chunks(updates, 100):
+        resp = wcapi.post(
+            f"products/{product_id}/variations/batch",
+            {"update": chunk},
+        )
+        resp.raise_for_status()
+        if resp.json().get("update") is None:
+            raise RuntimeError("WooCommerce batch update partially failed")
+```
+
+WooCommerce 배치 응답은 성공/실패 항목을 각각 배열로 반환합니다. **`update` 키가 `None`이거나 누락된 항목이 있으면 반드시 로그를 남기고 개별 재시도**해야 합니다. 배치에서 일부만 실패해도 HTTP 상태 코드는 200으로 올 수 있기 때문입니다.
+
+---
+
+## 6. Shopify GraphQL — 상품 생성과 재고 조정
+
+### 6-1. 속도 제한 이해
+
+Shopify GraphQL은 **쿼리 비용(cost)** 기반입니다. 필드 타입별 기본 비용은 스칼라·Enum이 0, 객체가 1, **뮤테이션이 10**입니다. 응답의 `extensions.cost.throttleStatus`에서 현재 버킷 잔량과 회복 속도를 확인할 수 있습니다.
+
+```python
+# clients/shopify_client.py
+import os, time, requests
+from config import SHOPIFY_SHOP, SHOPIFY_TOKEN, SHOPIFY_API_VERSION
+
+GRAPHQL_URL = (
+    f"https://{SHOPIFY_SHOP}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+)
+HEADERS = {
+    "X-Shopify-Access-Token": SHOPIFY_TOKEN,
+    "Content-Type": "application/json",
+}
+
+class ShopifyClient:
+    def __init__(self):
+        self.session = requests.Session()
+        self.throttle = {"available": 1000, "restore": 100}
+
+    def execute(self, query: str, variables: dict | None = None) -> dict:
+        while True:
+            resp = self.session.post(
+                GRAPHQL_URL,
+                headers=HEADERS,
+                json={"query": query, "variables": variables or {}},
+                timeout=60,
+            )
+            if resp.status_code == 429:
+                time.sleep(2)
+                continue
+            resp.raise_for_status()
+            body = resp.json()
+            cost = body.get("extensions", {}).get("cost", {})
+            if cost:
+                status = cost.get("throttleStatus", {})
+                self.throttle["available"] = status.get("currentlyAvailable", 1000)
+                self.throttle["restore"] = status.get("restoreRate", 100)
+            if "errors" in body:
+                raise RuntimeError(f"Shopify GraphQL errors: {body['errors']}")
+            return body["data"]
+
+    def wait_for_budget(self, estimated_cost: int = 100):
+        while self.throttle["available"] < estimated_cost:
+            time.sleep(1)
+```
+
+`throttleStatus.currentlyAvailable`가 예상 비용보다 작으면 잠시 대기하는 **사전 백오프**가 429를 맞는 것보다 효율적입니다.
+
+### 6-2. 상품 + 변형 일괄 생성
+
+Shopify에서는 `productCreate`로 상품을 만든 뒤 `productVariantsBulkCreate`로 변형을 추가합니다. `ProductVariantsBulkInput`에는 `inventoryQuantities` 배열을 포함해 **재고 수량을 변형 생성과 동시에 지정**할 수 있습니다.
+
+```python
+PRODUCT_CREATE = """
+mutation ProductCreate($input: ProductInput!) {
+  productCreate(input: $input) {
+    product { id title }
+    userErrors { field message }
+  }
+}
+"""
+
+VARIANTS_BULK_CREATE = """
+mutation VariantsBulkCreate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+  productVariantsBulkCreate(productId: $productId, variants: $variants) {
+    productVariants { id sku inventoryItem { id } }
+    userErrors { field message }
+  }
+}
+"""
+
+def create_shopify_product(client: ShopifyClient, p: NormalizedProduct,
+                           location_id: str) -> dict:
+    data = client.execute(PRODUCT_CREATE, {
+        "input": {
+            "title": p.title,
+            "descriptionHtml": p.description_html,
+            "status": "DRAFT",
+            "tags": p.tags,
+        }
+    })
+    errors = data["productCreate"]["userErrors"]
+    if errors:
+        raise RuntimeError(errors)
+    product_gid = data["productCreate"]["product"]["id"]
+
+    option_names = list(p.variants[0].options.keys())
+    variants_input = []
+    for v in p.variants:
+        variants_input.append({
+            "price": str(v.price),
+            "sku": v.supplier_sku,
+            "optionValues": [
+                {"optionName": k, "name": val} for k, val in v.options.items()
+            ],
+            "inventoryQuantities": [{
+                "locationId": location_id,
+                "name": "available",
+                "quantity": v.stock,
+            }],
+        })
+
+    # input 배열 최대 250개 — 초과 시 분할
+    created = []
+    for chunk in _chunks(variants_input, 250):
+        d = client.execute(VARIANTS_BULK_CREATE, {
+            "productId": product_gid,
+            "variants": chunk,
+        })
+        errs = d["productVariantsBulkCreate"]["userErrors"]
+        if errs:
+            raise RuntimeError(errs)
+        created.extend(d["productVariantsBulkCreate"]["productVariants"])
+
+    return {"product_gid": product_gid, "variants": created}
+```
+
+**GraphQL 입력 배열 제한:** Shopify는 배열 인자의 최대 크기를 **250**으로 제한하며, 초과 시 오류를 반환합니다. 변형이 250개를 넘으면 반드시 분할해야 합니다.
+
+### 6-3. 재고 조정 — `inventoryAdjustQuantities`
+
+변형 생성 후 재고 변경은 `inventoryAdjustQuantities` 뮤테이션으로 처리합니다. 이때 **`inventoryItem.id`** 가 필요하므로, 변형 생성 응답에서 함께 저장해 두어야 합니다.
+
+```python
+INVENTORY_ADJUST = """
+mutation Adjust($input: InventoryAdjustQuantitiesInput!) {
+  inventoryAdjustQuantities(input: $input) {
+    inventoryAdjustmentGroup { createdAt reason }
+    userErrors { field message }
+  }
+}
+"""
+
+def adjust_shopify_inventory(client, inventory_item_gid, location_id,
+                             delta: int, reason="correction"):
+    if delta == 0:
+        return
+    data = client.execute(INVENTORY_ADJUST, {
+        "input": {
+            "reason": reason,
+            "name": "available",
+            "changes": [{
+                "delta": delta,
+                "inventoryItemId": inventory_item_gid,
+                "locationId": location_id,
+            }],
+        }
+    })
+    errs = data["inventoryAdjustQuantities"]["userErrors"]
+    if errs:
+        raise RuntimeError(errs)
+```
+
+`delta`는 **현재 재고와 목표 재고의 차이**입니다. 공급처 재고를 절대값으로 덮어쓰면 채널에서 발생한 판매가 반영되지 않을 수 있으므로, 로컬에 마지막으로 푸시한 값을 기록해 두고 `new_stock - last_pushed_stock`을 계산하는 방식이 안전합니다. 이 값은 `channel_variants` 테이블에 `last_pushed_qty` 컬럼을 추가해 관리합니다.
+
+---
+
+## 7. 재고 동기화 잡 — 상품 등록보다 더 중요
+
+상품 등록은 1회성이지만 **재고·가격은 지속적으로 변합니다**. 공급처 재고가 0이 되었는데 채널에 그대로 남아 있으면 오버셀이 발생하고, 가격이 인상되었는데 반영되지 않으면 마진이 사라집니다.
+
+```python
+# services/inventory_sync.py
+from db import DB_PATH
+from clients.cj_client import CJClient
+from clients.woo_client import batch_update_woo_variations
+from clients.shopify_client import ShopifyClient, adjust_shopify_inventory
+
+def sync_inventory():
+    cj = CJClient()
+    shopify = ShopifyClient()
+
+    # 1) 매핑된 공급처 SKU 목록을 DB에서 조회
+    rows = _mapped_skus()
+
+    # 2) 공급처 변형 정보를 일괄 조회 (캐시 우선)
+    for supplier_sku, channel_rows in rows.items():
+        variant = _get_supplier_variant_cached(cj, supplier_sku)
+        if variant is None:
+            continue
+
+        for cr in channel_rows:
+            if cr["channel"] == "woocommerce":
+                _push_woo(cr, variant)
+            elif cr["channel"] == "shopify":
+                _push_shopify(shopify, cr, variant)
+```
+
+**캐시 전략:** CJ는 `variant/query` 호출당 10포인트를 소모하므로, 매 동기화마다 모든 SKU를 재조회하면 포인트가 빠르게 고갈됩니다. `supplier_products.last_synced`를 기준으로 **N분 이내 데이터는 재사용**하고, 오래된 것만 갱신합니다.
+
+**웹훅 보완:** Shopify는 `inventory_levels/update` 웹훅을 제공하므로, 채널에서 발생한 판매로 재고가 변하면 즉시 로컬에 반영할 수 있습니다. 폴링만으로는 폴링 간격 동안의 오버셀을 막을 수 없으므로, **웹훅(인바운드) + GraphQL 푸시(아웃바운드)** 조합이 정석입니다.
+
+---
+
+## 8. 에러 처리와 데이터 보존 규칙
+
+### 8-1. 부분 실패 처리
+
+채널 API는 **HTTP 200을 반환하면서 개별 항목 오류를 본문에 담는 경우**가 많습니다. WooCommerce 배치의 `update: null`, Shopify GraphQL의 `userErrors` 배열이 대표적입니다. 업로더는 반드시 이들을 검사하고, 실패 항목만 별도 큐에 넣어 재시도해야 합니다.
+
+```python
+def upload_with_fallback(uploader, product, channel):
+    try:
+        return uploader(product)
+    except Exception as e:
+        _log_failure(channel, product.canonical_sku, str(e))
+        return None
+```
+
+### 8-2. 널 필드 보존
+
+Shopify 재동기화 시 부분 페이로드에 필드가 누락되어 `null`이 오는 경우가 있습니다. 이를 그대로 로컬에 덮어쓰면 **가격·바코드·SKU가 소실**됩니다. 소스가 `null`이면 로컬 값을 유지하는 **필드별 허용 목록(allowlist)** 방식을 적용해야 합니다.
+
+### 8-3. 이미지 처리
+
+공급처 이미지 URL을 그대로 채널에 전달하면 채널의 이미지 페처가 실패할 수 있습니다. 가능하면 **로컬에 다운로드 → 각 채널의 미디어 업로드 API 사용**이 안정적입니다. Shopify는 `productCreateMedia`, WooCommerce는 `products/{id}/images`를 사용합니다. 재연결 시 중복 다운로드를 막기 위해 **이미지 URL 기준으로 매칭**하고 커넥션 ID에 의존하지 않습니다.
+
+---
+
+## 9. 초기 동기화 vs 주기 동기화 운영 전략
+
+| 구분 | 트리거 | 상태 | API 사용 |
+|---|---|---|---|
+| 초기 상품 등록 | 수동 CLI | `draft` | CJ `listV2` + `variant/query` → Woo 배치 생성 / Shopify GraphQL 생성 |
+| 검수 후 게시 | 수동 승인 | `publish` / `ACTIVE` | Woo `products/batch`, Shopify `productUpdate` |
+| 재고·가격 | 15~60분 폴링 + Shopify 웹훅 | 유지 | 캐시된 변형 데이터 → Woo variations 배치 / Shopify `inventoryAdjustQuantities` |
+| 대량 재조정 | 일 1회 | 유지 | Shopify Bulk Operations (일반 비용 제한 우회) |
+
+**초기 등록은 반드시 `draft`로.** 드랍쉽핑 공급처 데이터는 설명 누락, 이미지 깨짐, 변형 옵션 불일치가 빈번합니다. `draft` 상태에서 사람이 검수한 뒤 `publish`하는 워크플로가 초기 사고를 크게 줄입니다.
+
+**대량 작업은 Bulk Operations 활용.** Shopify의 Bulk Operations는 일반 쿼리 비용 제한과 속도 제한을 받지 않으므로, 수천 개 상품의 초기 마이그레이션이나 대규모 재고 재조정에 적합합니다. 단, Bulk는 비동기이므로 결과 JSONL을 폴링해야 합니다.
+
+---
+
+## 10. `.env` 예시
+
+```ini
+# CJ
+CJ_BASE=https://developers.cjdropshipping.com/api2.0/v1
+CJ_EMAIL=your@email.com
+CJ_API_KEY=your_api_key
+CJ_QPS=1
+
+# WooCommerce
+WC_URL=https://your-store.com
+WC_CK=ck_...
+WC_CS=cs_...
+
+# Shopify
+SHOPIFY_SHOP=your-store.myshopify.com
+SHOPIFY_TOKEN=shpat_...
+SHOPIFY_API_VERSION=2025-01
+SHOPIFY_LOCATION_ID=gid://shopify/Location/123456
+```
+
+---
+
+### 요약하면
+
+이 시스템의 안정성은 **코드 양이 아니라 세 가지 설계 결정**에서 나옵니다. 첫째, **`channel_variants` 테이블에 채널 변형 ID를 영구 저장**해 SKU 중복·변경에 면역을 갖는 것. 둘째, **CJ는 등급별 QPS와 포인트 소모를, Shopify는 cost bucket을 사전에 계산해 백오프**하는 것. 셋째, **재고 동기화를 상품 등록과 분리하고 Shopify 웹훅으로 인바운드를 보완**하는 것입니다. 이 세 가지를 갖추면 공급처나 채널이 추가되어도 `Fetcher`와 `Uploader`만 교체해 확장할 수 있습니다.

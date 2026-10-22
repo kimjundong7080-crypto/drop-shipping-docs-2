@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>주문 미리보기 #{{ order.id }}</title>
+  <style>
+    body { font-family: sans-serif; margin: 2rem; }
+    table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+    th, td { border: 1px solid #ccc; padding: 6px 10px; text-align: left; }
+    th { background: #f5f5f5; }
+    .unmapped { color: #c0392b; font-weight: bold; }
+    .badge { padding: 2px 8px; border-radius: 4px; background: #eee; }
+  </style>
+</head>
+<body>
+  <h1>주문 미리보기</h1>
+
+  <h2>주문 정보</h2>
+  <table>
+    <tr><th>채널</th><td>{{ order.channel }}</td></tr>
+    <tr><th>채널 주문 ID</th><td>{{ order.channel_order_id }}</td></tr>
+    <tr><th>주문 번호</th><td>{{ order.channel_order_num }}</td></tr>
+    <tr><th>상태</th><td><span class="badge">{{ order.status }}</span></td></tr>
+    <tr><th>결제 상태</th><td><span class="badge">{{ order.financial_status }}</span></td></tr>
+    <tr><th>총액</th><td>{{ order.total }} {{ order.currency }}</td></tr>
+    <tr><th>고객 이메일</th><td>{{ order.customer_email }}</td></tr>
+    <tr><th>수집 시각</th><td>{{ order.fetched_at }}</td></tr>
+  </table>
+
+  <h2>품목 (매핑되지 않은 품목은 발주를 보류하세요)</h2>
+  <table>
+    <thead>
+      <tr><th>#</th><th>품목명</th><th>공급처 SKU</th><th>수량</th><th>단가</th><th>매핑</th></tr>
+    </thead>
+    <tbody>
+      {% for it in items %}
+      <tr>
+        <td>{{ it.id }}</td>
+        <td>{{ it.channel_item_name or '' }}</td>
+        <td class="{{ 'unmapped' if not it.mapped }}">{{ it.supplier_sku or '-' }}</td>
+        <td>{{ it.quantity }}</td>
+        <td>{{ it.unit_price }}</td>
+        <td class="{{ 'unmapped' if not it.mapped }}">{{ 'OK' if it.mapped else '미매핑' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>CJ 발주 상태</h2>
+  {% if cj_order %}
+  <table>
+    <tr><th>CJ 주문 번호</th><td>{{ cj_order.cj_order_number }}</td></tr>
+    <tr><th>CJ 주문 ID</th><td>{{ cj_order.cj_order_id }}</td></tr>
+    <tr><th>상태</th><td><span class="badge">{{ cj_order.status }}</span></td></tr>
+    <tr><th>송장번호</th><td>{{ cj_order.tracking_number }}</td></tr>
+    <tr><th>물류사</th><td>{{ cj_order.logistic_name }}</td></tr>
+    <tr><th>샌드박스</th><td>{{ cj_order.is_sandbox }}</td></tr>
+  </table>
+  {% else %}
+  <p>아직 발주 기록이 없습니다. (<code>orders place --order-id {{ order.id }} --sandbox-first</code>로 샌드박스 검증 후 발주)</p>
+  {% endif %}
+</body>
+</html>
